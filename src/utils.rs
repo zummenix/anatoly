@@ -6,6 +6,10 @@ pub(crate) struct SnipTextFmtCtx {
     pub(crate) max_bytes: usize,
 }
 
+/// Snips `text` to fit within `max_bytes` by appending a message from `snip_text_fmt`.
+///
+/// Note: if the formatted snip message produced by `snip_text_fmt` is longer than
+/// `max_bytes`, the returned string may exceed `max_bytes` in length.
 pub(crate) fn snip_long_text(
     text: Cow<'_, str>,
     max_bytes: usize,
