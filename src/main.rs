@@ -15,6 +15,10 @@ use std::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod utils;
+
+use crate::utils::{SnipTextCtx, snip_long_text};
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
@@ -219,7 +223,7 @@ fn run_safe_shell_cmd(
          }| { format!("\n\n[... Output truncated. First {max_bytes} bytes shown ...]",) };
     if output.status.success() {
         let raw_output = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(snip_long_text(raw_output, 10_000, snip_message_fmt))
+        Ok(utils::snip_long_text(raw_output, 10_000, snip_message_fmt))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         Err(SafeShellToolError::Failure(snip_long_text(
@@ -228,38 +232,6 @@ fn run_safe_shell_cmd(
             snip_message_fmt,
         )))
     }
-}
-
-#[derive(Debug)]
-struct SnipTextCtx {
-    bytes: usize,
-    max_bytes: usize,
-}
-
-fn snip_long_text(
-    output: String,
-    max_bytes: usize,
-    snip_message_fmt: impl Fn(SnipTextCtx) -> String,
-) -> String {
-    if output.len() <= max_bytes {
-        return output;
-    }
-
-    let snip_msg = snip_message_fmt(SnipTextCtx {
-        bytes: output.len(),
-        max_bytes,
-    });
-    let mut truncated = output;
-
-    let mut byte_limit = max_bytes.saturating_sub(snip_msg.len());
-
-    while !truncated.is_char_boundary(byte_limit) && byte_limit > 0 {
-        byte_limit -= 1;
-    }
-
-    truncated.truncate(byte_limit);
-    truncated.push_str(&snip_msg);
-    truncated
 }
 
 fn allowed_cmds() -> HashSet<String> {
