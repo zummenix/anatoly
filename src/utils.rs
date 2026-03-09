@@ -1,31 +1,65 @@
+use std::borrow::Cow;
+
 #[derive(Debug)]
-pub(crate) struct SnipTextCtx {
+pub(crate) struct SnipTextFmtCtx {
     pub(crate) bytes: usize,
     pub(crate) max_bytes: usize,
 }
 
 pub(crate) fn snip_long_text(
-    output: String,
+    text: Cow<'_, str>,
     max_bytes: usize,
-    snip_message_fmt: impl Fn(SnipTextCtx) -> String,
-) -> String {
-    if output.len() <= max_bytes {
-        return output;
+    snip_text_fmt: impl Fn(SnipTextFmtCtx) -> String,
+) -> Cow<'_, str> {
+    if text.len() <= max_bytes {
+        return text;
     }
 
-    let snip_msg = snip_message_fmt(SnipTextCtx {
-        bytes: output.len(),
+    let snip_msg = snip_text_fmt(SnipTextFmtCtx {
+        bytes: text.len(),
         max_bytes,
     });
-    let mut truncated = output;
-
     let mut byte_limit = max_bytes.saturating_sub(snip_msg.len());
 
-    while !truncated.is_char_boundary(byte_limit) && byte_limit > 0 {
+    while byte_limit > 0 && !text.is_char_boundary(byte_limit) {
         byte_limit -= 1;
     }
+    let mut result = String::with_capacity(byte_limit + snip_msg.len());
+    result.push_str(&text[..byte_limit]);
+    result.push_str(&snip_msg);
+    Cow::from(result)
+}
 
-    truncated.truncate(byte_limit);
-    truncated.push_str(&snip_msg);
-    truncated
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use insta::assert_snapshot;
+
+    #[test]
+    fn snip_long_text_does_not_snip_short_text() {
+        let short_text = "Hello";
+        let max_bytes = 5;
+        let result = snip_long_text(short_text.into(), max_bytes, |_| String::from("..."));
+        assert_snapshot!(result, @"Hello");
+    }
+
+    #[test]
+    fn snip_long_text_snips_ascii_text() {
+        let long_text = "Hello, World!".repeat(3);
+        let max_bytes = 35;
+        let result = snip_long_text(long_text.into(), max_bytes, |ctx| {
+            format!("... bytes: {}, max_bytes: {}", ctx.bytes, ctx.max_bytes)
+        });
+        assert_snapshot!(result, @"Hello, ... bytes: 39, max_bytes: 35");
+    }
+
+    #[test]
+    fn snip_long_text_snips_unicode_text() {
+        let long_text = "こんにちは、世界！".repeat(3);
+        let max_bytes = 32;
+        let result = snip_long_text(long_text.into(), max_bytes, |ctx| {
+            format!("... bytes: {}, max_bytes: {}", ctx.bytes, ctx.max_bytes)
+        });
+        assert_snapshot!(result, @"こ... bytes: 81, max_bytes: 32");
+    }
 }

@@ -9,6 +9,7 @@ use rig::{
 };
 use serde_json::json;
 use std::{
+    borrow::Cow,
     collections::HashSet,
     io::{self, Write},
     process::Command,
@@ -17,7 +18,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod utils;
 
-use crate::utils::{SnipTextCtx, snip_long_text};
+use crate::utils::{SnipTextFmtCtx, snip_long_text};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -114,9 +115,9 @@ impl<'a, M: CompletionModel> PromptHook<M> for ToolHook<'a> {
             tool_name,
             args,
             snip_long_text(
-                String::from(result),
+                Cow::from(result),
                 300,
-                |SnipTextCtx {
+                |SnipTextFmtCtx {
                      bytes,
                      max_bytes: _,
                  }| { format!("... (total {bytes}b)") }
@@ -217,20 +218,18 @@ fn run_safe_shell_cmd(
         .map_err(|e| SafeShellToolError::FailedToExecute(String::from(command), e))?;
 
     let snip_message_fmt =
-        |SnipTextCtx {
+        |SnipTextFmtCtx {
              bytes: _,
              max_bytes,
          }| { format!("\n\n[... Output truncated. First {max_bytes} bytes shown ...]",) };
     if output.status.success() {
-        let raw_output = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(utils::snip_long_text(raw_output, 10_000, snip_message_fmt))
+        let raw_output = String::from_utf8_lossy(&output.stdout);
+        Ok(utils::snip_long_text(raw_output, 10_000, snip_message_fmt).into())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(SafeShellToolError::Failure(snip_long_text(
-            String::from(stderr),
-            5000,
-            snip_message_fmt,
-        )))
+        Err(SafeShellToolError::Failure(
+            snip_long_text(stderr, 5000, snip_message_fmt).into(),
+        ))
     }
 }
 
