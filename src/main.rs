@@ -1,9 +1,11 @@
 use rig::{
-    agent::AgentBuilder,
+    agent::{AgentBuilder, HookAction, PromptHook, ToolCallHookAction},
     client::{CompletionClient, ProviderClient},
-    completion::{Prompt, ToolDefinition},
+    completion::{CompletionModel, CompletionResponse, Prompt, ToolDefinition},
+    message::Message,
     providers::openrouter,
     tool::Tool,
+    tools::ThinkTool,
 };
 use serde_json::json;
 use std::{
@@ -29,40 +31,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let allowed_cmds = allowed_cmds();
 
-    let sentinel_agent = AgentBuilder::new(llm.clone())
-        .name("Sentinel")
-        .description("An AI agent specialized in exploring and understanding complex codebases")
-        .max_tokens(512)
-        .default_max_turns(100)
-        .preamble(
-            r#"
-You are Sentinel, an AI agent specialized in exploring and understanding
-complex codebases. Your goal is to provide accurate architectural insights while
-maintaining a lean and high-signal context window.
-
-Use the tools provided to progress forward answering the user's question.
-
-Tool Guidance:
-- Before running a command, identify exactly what information you need.
-- Start with `ls` to understand the directory structure before diving into file
-  contents.
-- Your context window is your "scarce RAM." Every line of command output
-  consumes this budget. If an output is truncated, reduce scope search.
-            "#,
-        )
-        .tool(SafeShellTool { allowed_cmds })
-        .build();
-
     let code_assistant = AgentBuilder::new(llm)
         .name("Code Assistant")
         .max_tokens(1024)
-        .default_max_turns(10)
-        .preamble("You are code assistant. Use the tools provided to answer user's question.")
-        .tool(sentinel_agent)
+        .default_max_turns(100)
+        .preamble("You are code assistant helping user to devise the best solutions. Use the tools provided to answer user's question.")
+        .hook(ToolHook {
+            agent_name: "Code Assistant",
+        })
+        .tool(ThinkTool)
+        .tool(SafeShellTool { allowed_cmds })
         .build();
 
     println!("Good day, sir! What can I help you with?\nCtrl-C to exit\n");
 
+    let mut history: Vec<Message> = vec![];
     loop {
         print!("> ");
         io::stdout().flush()?;
@@ -71,7 +54,11 @@ Tool Guidance:
 
         let mut retrying_interval = 1;
         loop {
-            match code_assistant.prompt(prompt.trim()).await {
+            match code_assistant
+                .prompt(prompt.trim())
+                .with_history(&mut history)
+                .await
+            {
                 Ok(response) => {
                     println!("\n\n---\n{response}\n---\n\n");
                     break;
@@ -86,6 +73,65 @@ Tool Guidance:
                 }
             }
         }
+    }
+}
+
+#[derive(Clone)]
+struct ToolHook<'a> {
+    agent_name: &'a str,
+}
+
+impl<'a, M: CompletionModel> PromptHook<M> for ToolHook<'a> {
+    async fn on_tool_call(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        _internal_call_id: &str,
+        args: &str,
+    ) -> ToolCallHookAction {
+        println!(
+            "\n[{}] => CALLING TOOL: {}\n{}\n",
+            self.agent_name, tool_name, args
+        );
+        ToolCallHookAction::Continue
+    }
+
+    async fn on_tool_result(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        _internal_call_id: &str,
+        args: &str,
+        result: &str,
+    ) -> HookAction {
+        println!(
+            "\n[{}] <= TOOL RESULT {}\n{}\n{}",
+            self.agent_name,
+            tool_name,
+            args,
+            snip_long_text(
+                String::from(result),
+                300,
+                |SnipTextCtx {
+                     bytes,
+                     max_bytes: _,
+                 }| { format!("... (total {bytes}b)") }
+            )
+        );
+
+        HookAction::cont()
+    }
+
+    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
+        HookAction::cont()
+    }
+
+    async fn on_completion_response(
+        &self,
+        _prompt: &Message,
+        _response: &CompletionResponse<M::Response>,
+    ) -> HookAction {
+        HookAction::cont()
     }
 }
 
@@ -146,7 +192,6 @@ impl Tool for SafeShellTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        println!("\n\nCalling {} with cmd: {}\n\n", Self::NAME, args.cmd);
         run_safe_shell_cmd(&args.cmd, &self.allowed_cmds)
     }
 }
@@ -167,25 +212,44 @@ fn run_safe_shell_cmd(
         .output()
         .map_err(|e| SafeShellToolError::FailedToExecute(String::from(command), e))?;
 
+    let snip_message_fmt =
+        |SnipTextCtx {
+             bytes: _,
+             max_bytes,
+         }| { format!("\n\n[... Output truncated. First {max_bytes} bytes shown ...]",) };
     if output.status.success() {
         let raw_output = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(truncate_output(raw_output, 10_000))
+        Ok(snip_long_text(raw_output, 10_000, snip_message_fmt))
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(SafeShellToolError::Failure(truncate_output(
+        Err(SafeShellToolError::Failure(snip_long_text(
             String::from(stderr),
             5000,
+            snip_message_fmt,
         )))
     }
 }
 
-fn truncate_output(output: String, max_bytes: usize) -> String {
+#[derive(Debug)]
+struct SnipTextCtx {
+    bytes: usize,
+    max_bytes: usize,
+}
+
+fn snip_long_text(
+    output: String,
+    max_bytes: usize,
+    snip_message_fmt: impl Fn(SnipTextCtx) -> String,
+) -> String {
     if output.len() <= max_bytes {
         return output;
     }
 
+    let snip_msg = snip_message_fmt(SnipTextCtx {
+        bytes: output.len(),
+        max_bytes,
+    });
     let mut truncated = output;
-    let snip_msg = format!("\n\n[... Output truncated. First {max_bytes} bytes shown ...]",);
 
     let mut byte_limit = max_bytes.saturating_sub(snip_msg.len());
 
