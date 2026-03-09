@@ -9,11 +9,16 @@ use rig::{
 };
 use serde_json::json;
 use std::{
+    borrow::Cow,
     collections::HashSet,
     io::{self, Write},
     process::Command,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
+mod utils;
+
+use crate::utils::{SnipTextFmtCtx, snip_long_text};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -110,9 +115,9 @@ impl<'a, M: CompletionModel> PromptHook<M> for ToolHook<'a> {
             tool_name,
             args,
             snip_long_text(
-                String::from(result),
+                Cow::from(result),
                 300,
-                |SnipTextCtx {
+                |SnipTextFmtCtx {
                      bytes,
                      max_bytes: _,
                  }| { format!("... (total {bytes}b)") }
@@ -213,53 +218,19 @@ fn run_safe_shell_cmd(
         .map_err(|e| SafeShellToolError::FailedToExecute(String::from(command), e))?;
 
     let snip_message_fmt =
-        |SnipTextCtx {
+        |SnipTextFmtCtx {
              bytes: _,
              max_bytes,
          }| { format!("\n\n[... Output truncated. First {max_bytes} bytes shown ...]",) };
     if output.status.success() {
-        let raw_output = String::from_utf8_lossy(&output.stdout).to_string();
-        Ok(snip_long_text(raw_output, 10_000, snip_message_fmt))
+        let raw_output = String::from_utf8_lossy(&output.stdout);
+        Ok(utils::snip_long_text(raw_output, 10_000, snip_message_fmt).into())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        Err(SafeShellToolError::Failure(snip_long_text(
-            String::from(stderr),
-            5000,
-            snip_message_fmt,
-        )))
+        Err(SafeShellToolError::Failure(
+            snip_long_text(stderr, 5000, snip_message_fmt).into(),
+        ))
     }
-}
-
-#[derive(Debug)]
-struct SnipTextCtx {
-    bytes: usize,
-    max_bytes: usize,
-}
-
-fn snip_long_text(
-    output: String,
-    max_bytes: usize,
-    snip_message_fmt: impl Fn(SnipTextCtx) -> String,
-) -> String {
-    if output.len() <= max_bytes {
-        return output;
-    }
-
-    let snip_msg = snip_message_fmt(SnipTextCtx {
-        bytes: output.len(),
-        max_bytes,
-    });
-    let mut truncated = output;
-
-    let mut byte_limit = max_bytes.saturating_sub(snip_msg.len());
-
-    while !truncated.is_char_boundary(byte_limit) && byte_limit > 0 {
-        byte_limit -= 1;
-    }
-
-    truncated.truncate(byte_limit);
-    truncated.push_str(&snip_msg);
-    truncated
 }
 
 fn allowed_cmds() -> HashSet<String> {
