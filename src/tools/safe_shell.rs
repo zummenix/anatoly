@@ -1,6 +1,5 @@
 use crate::utils::{SnipTextFmtCtx, snip_long_text};
 use rig::{completion::ToolDefinition, tool::Tool};
-use serde_json::json;
 use std::process::Command;
 
 pub(crate) struct SafeShellTool;
@@ -15,7 +14,7 @@ pub(crate) enum SafeShellToolError {
     Failure(String),
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct SafeShellToolArgs {
     cmd: String,
 }
@@ -30,19 +29,11 @@ impl Tool for SafeShellTool {
     type Output = String;
 
     async fn definition(&self, _prompt: String) -> ToolDefinition {
+        let parameters = schemars::schema_for!(SafeShellToolArgs);
         ToolDefinition {
             name: Self::NAME.to_string(),
             description: "Runs safe shell commands like cat, grep, find, etc.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "cmd": {
-                        "type": "string",
-                        "description": "Shell command to run"
-                    },
-                },
-                "required": ["cmd"],
-            }),
+            parameters: serde_json::to_value(parameters).unwrap(),
         }
     }
 
