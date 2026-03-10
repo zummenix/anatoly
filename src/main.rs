@@ -10,7 +10,6 @@ use rig::{
 use serde_json::json;
 use std::{
     borrow::Cow,
-    collections::HashSet,
     io::{self, Write},
     process::Command,
 };
@@ -34,8 +33,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model_name = std::env::var("OPENROUTER_MODEL_NAME").expect("OPENROUTER_MODEL_NAME not set");
     let llm = client.completion_model(model_name);
 
-    let allowed_cmds = allowed_cmds();
-
     let code_assistant = AgentBuilder::new(llm)
         .name("Code Assistant")
         .max_tokens(1024)
@@ -45,7 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent_name: "Code Assistant",
         })
         .tool(ThinkTool)
-        .tool(SafeShellTool { allowed_cmds })
+        .tool(SafeShellTool)
         .build();
 
     println!("Good day, sir! What can I help you with?\nCtrl-C to exit\n");
@@ -140,17 +137,7 @@ impl<'a, M: CompletionModel> PromptHook<M> for ToolHook<'a> {
     }
 }
 
-struct SafeShellTool {
-    allowed_cmds: HashSet<String>,
-}
-
-impl SafeShellTool {
-    fn sorted_cmds(&self) -> Vec<String> {
-        let mut list: Vec<_> = self.allowed_cmds.iter().cloned().collect();
-        list.sort();
-        list
-    }
-}
+struct SafeShellTool;
 
 #[derive(Debug, thiserror::Error)]
 enum SafeShellToolError {
@@ -179,10 +166,7 @@ impl Tool for SafeShellTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: Self::NAME.to_string(),
-            description: format!(
-                "Runs safe shell commands: {}",
-                self.sorted_cmds().join(", ")
-            ),
+            description: "Runs safe shell commands like cat, grep, find, etc.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -197,15 +181,12 @@ impl Tool for SafeShellTool {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        run_safe_shell_cmd(&args.cmd, &self.allowed_cmds)
+        run_safe_shell_cmd(&args.cmd)
     }
 }
 
-fn run_safe_shell_cmd(
-    command: &str,
-    allowed_cmds: &HashSet<String>,
-) -> Result<String, SafeShellToolError> {
-    if !allowed_cmds.iter().any(|cmd| command.starts_with(cmd)) {
+fn run_safe_shell_cmd(command: &str) -> Result<String, SafeShellToolError> {
+    if !safe_chains::is_safe_command(command) {
         return Err(SafeShellToolError::CommandIsNotAllowed(String::from(
             command,
         )));
@@ -231,13 +212,4 @@ fn run_safe_shell_cmd(
             snip_long_text(stderr, 5000, snip_message_fmt).into(),
         ))
     }
-}
-
-fn allowed_cmds() -> HashSet<String> {
-    [
-        "ls", "grep", "cat", "head", "tail", "find", "wc", "jq", "file",
-    ]
-    .into_iter()
-    .map(String::from)
-    .collect()
 }
