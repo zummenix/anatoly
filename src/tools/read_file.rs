@@ -38,7 +38,55 @@ impl Tool for ReadFileTool {
 }
 
 fn run_read_file(file_path: &str) -> Result<String, ReadFileToolError> {
-    std::fs::read_to_string(file_path)
+    use std::path::{Path, PathBuf};
+
+    // Define the allowed root as the current working directory.
+    let root = std::env::current_dir()
+        .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))?;
+
+    // Build the requested path relative to the root if necessary.
+    let requested = Path::new(file_path);
+    let candidate: PathBuf = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+
+    // Canonicalize both root and candidate to resolve symlinks and `..`.
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))?;
+    let canonical_candidate = candidate
+        .canonicalize()
+        .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))?;
+
+    // Ensure the target path is inside the allowed root.
+    if !canonical_candidate.starts_with(&canonical_root) {
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Access to paths outside the workspace is not allowed",
+        );
+        return Err(ReadFileToolError::FailedToReadFile(
+            String::from(file_path),
+            io_err,
+        ));
+    }
+
+    // Optionally, reject symlinks to avoid symlink-based escapes.
+    let metadata = std::fs::symlink_metadata(&canonical_candidate)
+        .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))?;
+    if metadata.file_type().is_symlink() {
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Access to symbolic links is not allowed",
+        );
+        return Err(ReadFileToolError::FailedToReadFile(
+            String::from(file_path),
+            io_err,
+        ));
+    }
+
+    std::fs::read_to_string(&canonical_candidate)
         .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))
 }
 
@@ -74,32 +122,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_file_success() {
-        let file_env = FileEnv::new();
-        let path = file_env.write_file("hello.txt", "hi".as_bytes());
-        let tool = ReadFileTool;
-        let result = tool
-            .call(ReadFileToolArgs {
-                file_path: path.to_string_lossy().into(),
-            })
-            .await
-            .expect("tool success");
-        assert_snapshot!(result, @"hi");
-    }
-
-    #[tokio::test]
-    async fn read_file_failure() {
+    async fn read_file_permission_error() {
         let mut file_env = FileEnv::new();
         file_env.setup_insta_filter();
-        let mut path = file_env.write_file("hello.txt", "hi".as_bytes());
-        path.set_extension("md"); // changing extension, so the tool tries to read non existent file
+        let path = file_env.write_file("hello.txt", "hi".as_bytes());
         let tool = ReadFileTool;
-        let result = tool
+        let err = tool
             .call(ReadFileToolArgs {
                 file_path: path.to_string_lossy().into(),
             })
             .await
             .expect_err("tool failure");
-        assert_snapshot!(result, @"Failed to read file '[TEMP_DIR]/hello.md', IO Error: 'No such file or directory (os error 2)'");
+        assert_snapshot!(err, @"Failed to read file '[TEMP_DIR]/hello.txt', IO Error: 'Access to paths outside the workspace is not allowed'");
+    }
+
+    #[tokio::test]
+    async fn read_file_does_not_exist() {
+        let tool = ReadFileTool;
+        let err = tool
+            .call(ReadFileToolArgs {
+                file_path: String::from("abba.txt"),
+            })
+            .await
+            .expect_err("tool failure");
+        let ReadFileToolError::FailedToReadFile(file_path, io_error) = err;
+        assert_eq!(file_path, "abba.txt");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
     }
 }
