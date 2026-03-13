@@ -12,10 +12,12 @@ use std::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+#[cfg(test)]
+mod test_utils;
 mod tools;
 mod utils;
 
-use crate::tools::safe_shell::SafeShellTool;
+use crate::tools::{read_file::ReadFileTool, safe_shell::SafeShellTool};
 use crate::utils::{SnipTextFmtCtx, snip_long_text};
 
 #[tokio::main]
@@ -36,11 +38,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("Code Assistant")
         .max_tokens(1024)
         .default_max_turns(100)
-        .preamble("You are code assistant helping user to devise the best solutions. Use the tools provided to answer user's question.")
+        .preamble("You are code assistant helping user explore codebases and to devise the best solutions. Use the tools provided to answer user's question.")
         .hook(ToolHook {
             agent_name: "Code Assistant",
         })
         .tool(ThinkTool)
+        .tool(ReadFileTool::default())
         .tool(SafeShellTool)
         .build();
 
