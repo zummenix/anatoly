@@ -43,7 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent_name: "Code Assistant",
         })
         .tool(ThinkTool)
-        .tool(ReadFileTool)
+        .tool(ReadFileTool::default())
         .tool(SafeShellTool)
         .build();
 
