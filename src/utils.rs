@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::io;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub(crate) struct SnipTextFmtCtx {
@@ -32,6 +34,61 @@ pub(crate) fn snip_long_text(
     result.push_str(&text[..byte_limit]);
     result.push_str(&snip_msg);
     Cow::from(result)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FilePermissions {
+    pub(crate) canonical_root: PathBuf,
+}
+
+impl FilePermissions {
+    pub(crate) fn new() -> Result<Self, io::Error> {
+        Ok(Self {
+            canonical_root: std::env::current_dir()?.canonicalize()?,
+        })
+    }
+
+    /// Validates that a file path is allowed to read.
+    ///
+    /// - Ensures the path is within the current working directory.
+    /// - Rejects symbolic links to prevent symlink-based escapes.
+    ///
+    /// Returns the canonicalized path if valid, or an error if not.
+    pub(crate) fn validate_read(
+        &self,
+        file_path: impl Into<PathBuf>,
+    ) -> Result<PathBuf, io::Error> {
+        use std::io::{Error, ErrorKind};
+
+        // Build the requested path relative to the root if necessary.
+        let requested = file_path.into();
+        let candidate: PathBuf = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.canonical_root.join(requested)
+        };
+
+        let canonical_candidate = candidate.canonicalize()?;
+
+        // Ensure the target path is inside the allowed root.
+        if !canonical_candidate.starts_with(&self.canonical_root) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Access to paths outside the workspace is not allowed",
+            ));
+        }
+
+        // Reject symlinks to avoid symlink-based escapes.
+        let metadata = std::fs::symlink_metadata(&canonical_candidate)?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Access to symbolic links is not allowed",
+            ));
+        }
+
+        Ok(canonical_candidate)
+    }
 }
 
 #[cfg(test)]
