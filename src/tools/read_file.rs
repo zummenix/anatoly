@@ -300,7 +300,18 @@ mod tests {
         assert!(result.message.is_empty());
         // The fixture has 10 lines.
         assert_eq!(result.range_lines, "1,10");
-        assert!(result.content.contains("Lorem ipsum"));
+        assert_snapshot!(result.content, @r"
+        Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+        Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
+        Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.
+        Nisi ut aliquip ex ea commodo consequat.
+        Duis aute irure dolor in reprehenderit in voluptate velit esse cillum.
+        Dolore eu fugiat nulla pariatur.
+        Excepteur sint occaecat cupidatat non proident.
+        Sunt in culpa qui officia deserunt mollit anim id est laborum.
+        Curabitur pretium tincidunt lacus nulla non mauris bibendum condimentum.
+        Praesent dapibus, neque id cursus faucibus, tortor neque egestas augue.
+        ");
     }
 
     #[tokio::test]
@@ -317,6 +328,11 @@ mod tests {
         assert_eq!(result.truncated, None);
         assert!(result.message.is_empty());
         assert_eq!(result.range_lines, "2,4");
+        assert_snapshot!(result.content, @r"
+        Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
+        Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.
+        Nisi ut aliquip ex ea commodo consequat.
+        ");
     }
 
     #[tokio::test]
@@ -334,9 +350,13 @@ mod tests {
             .await
             .expect("tool success");
         assert_eq!(result.truncated, Some(true));
-        assert!(!result.message.is_empty());
+        assert_snapshot!(result.message, @"Output truncated at line 4: exceeded maximum line limit of 3.");
         assert_eq!(result.range_lines, "1,3");
-        assert_eq!(result.content.lines().count(), 3);
+        assert_snapshot!(result.content, @r"
+        Lorem ipsum dolor sit amet, consectetur adipiscing elit.
+        Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua.
+        Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris.
+        ");
     }
 
     #[tokio::test]
@@ -354,7 +374,7 @@ mod tests {
             .await
             .expect("tool success");
         assert_eq!(result.truncated, Some(true));
-        assert!(!result.message.is_empty());
-        assert!(result.content.len() <= 50);
+        assert_snapshot!(result.message, @"Output truncated at line 1: exceeded maximum byte limit of 50.");
+        assert_snapshot!(result.content, @"");
     }
 }
