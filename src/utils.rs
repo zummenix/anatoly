@@ -68,6 +68,15 @@ impl FilePermissions {
             self.canonical_root.join(requested)
         };
 
+        // Reject symlinks to avoid symlink-based escapes before resolving them.
+        let metadata = std::fs::symlink_metadata(&candidate)?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Access to symbolic links is not allowed",
+            ));
+        }
+
         let canonical_candidate = candidate.canonicalize()?;
 
         // Ensure the target path is inside the allowed root.
@@ -75,15 +84,6 @@ impl FilePermissions {
             return Err(Error::new(
                 ErrorKind::PermissionDenied,
                 "Access to paths outside the workspace is not allowed",
-            ));
-        }
-
-        // Reject symlinks to avoid symlink-based escapes.
-        let metadata = std::fs::symlink_metadata(&canonical_candidate)?;
-        if metadata.file_type().is_symlink() {
-            return Err(Error::new(
-                ErrorKind::PermissionDenied,
-                "Access to symbolic links is not allowed",
             ));
         }
 
