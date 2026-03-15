@@ -65,8 +65,18 @@ impl FilePermissions {
         let candidate: PathBuf = if requested.is_absolute() {
             requested.to_path_buf()
         } else {
-            self.canonical_root.join(requested)
+            self.canonical_root.join(&requested)
         };
+
+        // For absolute paths that are clearly outside the canonical root, deny
+        // access before attempting canonicalization to avoid leaking existence
+        // information about paths outside the workspace.
+        if requested.is_absolute() && !candidate.starts_with(&self.canonical_root) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Access to paths outside the workspace is not allowed",
+            ));
+        }
 
         // Reject symlinks to avoid symlink-based escapes before resolving them.
         let metadata = std::fs::symlink_metadata(&candidate)?;
