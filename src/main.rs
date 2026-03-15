@@ -17,8 +17,11 @@ mod test_utils;
 mod tools;
 mod utils;
 
-use crate::tools::{read_file::ReadFileTool, safe_shell::SafeShellTool};
 use crate::utils::{SnipTextFmtCtx, snip_long_text};
+use crate::{
+    tools::{read_file::ReadFileTool, safe_shell::SafeShellTool},
+    utils::FilePermissions,
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -29,6 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .with(tracing_subscriber::fmt::layer())
         .init();
+
+    let file_permissions = FilePermissions::new()?;
 
     let client = openrouter::Client::from_env();
     let model_name = std::env::var("OPENROUTER_MODEL_NAME").expect("OPENROUTER_MODEL_NAME not set");
@@ -43,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             agent_name: "Code Assistant",
         })
         .tool(ThinkTool)
-        .tool(ReadFileTool::default())
+        .tool(ReadFileTool::new(file_permissions))
         .tool(SafeShellTool)
         .build();
 

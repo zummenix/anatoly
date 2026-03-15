@@ -1,4 +1,6 @@
 use std::borrow::Cow;
+use std::io;
+use std::path::PathBuf;
 
 #[derive(Debug)]
 pub(crate) struct SnipTextFmtCtx {
@@ -34,10 +36,80 @@ pub(crate) fn snip_long_text(
     Cow::from(result)
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct FilePermissions {
+    pub(crate) canonical_root: PathBuf,
+}
+
+impl FilePermissions {
+    pub(crate) fn new() -> Result<Self, io::Error> {
+        Self::with_root(std::env::current_dir()?)
+    }
+
+    fn with_root(root: PathBuf) -> Result<Self, io::Error> {
+        Ok(Self {
+            canonical_root: root.canonicalize()?,
+        })
+    }
+
+    /// Validates that a file path is allowed to read.
+    ///
+    /// - Ensures the path is within the current working directory.
+    /// - Rejects symbolic links to prevent symlink-based escapes.
+    ///
+    /// Returns the canonicalized path if valid, or an error if not.
+    pub(crate) fn validate_read(
+        &self,
+        file_path: impl Into<PathBuf>,
+    ) -> Result<PathBuf, io::Error> {
+        use std::io::{Error, ErrorKind};
+
+        // Build the requested path relative to the root if necessary.
+        let requested = file_path.into();
+        let candidate: PathBuf = if requested.is_absolute() {
+            requested.to_path_buf()
+        } else {
+            self.canonical_root.join(&requested)
+        };
+
+        // For absolute paths that are clearly outside the canonical root, deny
+        // access before attempting canonicalization to avoid leaking existence
+        // information about paths outside the workspace.
+        if requested.is_absolute() && !candidate.starts_with(&self.canonical_root) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Access to paths outside the workspace is not allowed",
+            ));
+        }
+
+        // Reject symlinks to avoid symlink-based escapes before resolving them.
+        let metadata = std::fs::symlink_metadata(&candidate)?;
+        if metadata.file_type().is_symlink() {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Access to symbolic links is not allowed",
+            ));
+        }
+
+        let canonical_candidate = candidate.canonicalize()?;
+
+        // Ensure the target path is inside the allowed root.
+        if !canonical_candidate.starts_with(&self.canonical_root) {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "Access to paths outside the workspace is not allowed",
+            ));
+        }
+
+        Ok(canonical_candidate)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use insta::assert_snapshot;
+    use temp_dir::TempDir;
 
     #[test]
     fn snip_long_text_does_not_snip_short_text() {
@@ -65,5 +137,53 @@ mod tests {
             format!("... bytes: {}, max_bytes: {}", ctx.bytes, ctx.max_bytes)
         });
         assert_snapshot!(result, @"こ... bytes: 81, max_bytes: 32");
+    }
+
+    #[test]
+    fn validate_read_allows_existing_file_within_workspace() {
+        let workspace = TempDir::new().expect("create temp dir");
+        let permissions =
+            FilePermissions::with_root(workspace.path().into()).expect("create file permissions");
+
+        let path = workspace.child("test.txt");
+        std::fs::write(&path, b"hello").expect("write file");
+        let canonical_path = path.canonicalize().expect("canonicalize path");
+
+        let validated_file_path = permissions
+            .validate_read(canonical_path)
+            .expect("path is valid");
+        assert_eq!(validated_file_path.file_name().unwrap(), "test.txt");
+    }
+
+    #[test]
+    fn validate_read_rejects_paths_outside_workspace() {
+        let workspace = TempDir::new().expect("create temp dir");
+        let permissions =
+            FilePermissions::with_root(workspace.path().into()).expect("create file permissions");
+
+        let outside_path = TempDir::new().expect("create outside temp dir");
+        let err = permissions
+            .validate_read(outside_path.path())
+            .expect_err("outside path is not allowed");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn validate_read_rejects_symlinks() {
+        let workspace = TempDir::new().expect("create temp dir");
+        let permissions =
+            FilePermissions::with_root(workspace.path().into()).expect("create file permissions");
+
+        let target = workspace.child("target.txt");
+        std::fs::write(&target, b"content").expect("write target file");
+
+        let symlink = workspace.child("symlink.txt");
+        std::os::unix::fs::symlink(&target, &symlink).expect("create symlink");
+
+        let err = permissions
+            .validate_read(symlink)
+            .expect_err("symlinks are not allowed");
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

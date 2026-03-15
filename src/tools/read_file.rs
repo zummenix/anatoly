@@ -1,15 +1,20 @@
+use crate::utils::FilePermissions;
 use rig::{completion::ToolDefinition, tool::Tool};
+use std::io::{BufRead, BufReader};
 
 pub(crate) struct ReadFileTool {
+    /// File permissions to check for access to a file.
+    pub(crate) file_permissions: FilePermissions,
     /// Maximum number of lines to return in a single call.
     pub(crate) max_lines: usize,
     /// Maximum number of bytes to return in a single call.
     pub(crate) max_bytes: usize,
 }
 
-impl Default for ReadFileTool {
-    fn default() -> Self {
+impl ReadFileTool {
+    pub(crate) fn new(file_permissions: FilePermissions) -> Self {
         Self {
+            file_permissions,
             max_lines: 1_000,
             max_bytes: 100_000,
         }
@@ -68,6 +73,7 @@ impl Tool for ReadFileTool {
             &args.file_path,
             args.start_line,
             args.end_line,
+            &self.file_permissions,
             self.max_lines,
             self.max_bytes,
         )
@@ -78,59 +84,14 @@ fn run_read_file(
     file_path: &str,
     start_line: Option<usize>,
     end_line: Option<usize>,
+    file_permissions: &FilePermissions,
     max_lines: usize,
     max_bytes: usize,
 ) -> Result<ReadFileToolOutput, ReadFileToolError> {
-    use std::io::{BufRead, BufReader};
-    use std::path::{Path, PathBuf};
-
-    // Define the allowed root as the current working directory.
-    let root = std::env::current_dir()
+    let canonical_file_path = file_permissions
+        .validate_read(file_path)
         .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))?;
-
-    // Build the requested path relative to the root if necessary.
-    let requested = Path::new(file_path);
-    let candidate: PathBuf = if requested.is_absolute() {
-        requested.to_path_buf()
-    } else {
-        root.join(requested)
-    };
-
-    // Canonicalize both root and candidate to resolve symlinks and `..`.
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))?;
-    let canonical_candidate = candidate
-        .canonicalize()
-        .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))?;
-
-    // Ensure the target path is inside the allowed root.
-    if !canonical_candidate.starts_with(&canonical_root) {
-        let io_err = std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Access to paths outside the workspace is not allowed",
-        );
-        return Err(ReadFileToolError::FailedToReadFile(
-            String::from(file_path),
-            io_err,
-        ));
-    }
-
-    // Reject symlinks to avoid symlink-based escapes.
-    let metadata = std::fs::symlink_metadata(&canonical_candidate)
-        .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))?;
-    if metadata.file_type().is_symlink() {
-        let io_err = std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "Access to symbolic links is not allowed",
-        );
-        return Err(ReadFileToolError::FailedToReadFile(
-            String::from(file_path),
-            io_err,
-        ));
-    }
-
-    let file = std::fs::File::open(&canonical_candidate)
+    let file = std::fs::File::open(&canonical_file_path)
         .map_err(|err| ReadFileToolError::FailedToReadFile(String::from(file_path), err))?;
     let reader = BufReader::new(file);
 
@@ -209,7 +170,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_definition() {
-        let def = ReadFileTool::default()
+        let def = ReadFileTool::new(FilePermissions::new().unwrap())
             .definition(String::from("prompt"))
             .await;
         assert_snapshot!(serde_json::to_string_pretty(&def).unwrap(), @r#"
@@ -257,7 +218,7 @@ mod tests {
         let mut file_env = FileEnv::new();
         file_env.setup_insta_filter();
         let path = file_env.write_file("hello.txt", "hi".as_bytes());
-        let tool = ReadFileTool::default();
+        let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let err = tool
             .call(ReadFileToolArgs {
                 file_path: path.to_string_lossy().into(),
@@ -271,7 +232,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_does_not_exist() {
-        let tool = ReadFileTool::default();
+        let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let err = tool
             .call(ReadFileToolArgs {
                 file_path: String::from("abba.txt"),
@@ -287,7 +248,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_full() {
-        let tool = ReadFileTool::default();
+        let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let result = tool
             .call(ReadFileToolArgs {
                 file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
@@ -316,7 +277,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_line_range() {
-        let tool = ReadFileTool::default();
+        let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let result = tool
             .call(ReadFileToolArgs {
                 file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
@@ -337,10 +298,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_truncated_by_line_limit() {
-        let tool = ReadFileTool {
-            max_lines: 3,
-            max_bytes: 100_000,
-        };
+        let mut tool = ReadFileTool::new(FilePermissions::new().unwrap());
+        tool.max_lines = 3;
+        tool.max_bytes = 100_000;
         let result = tool
             .call(ReadFileToolArgs {
                 file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
@@ -361,10 +321,9 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_truncated_by_byte_limit() {
-        let tool = ReadFileTool {
-            max_lines: 1_000,
-            max_bytes: 50,
-        };
+        let mut tool = ReadFileTool::new(FilePermissions::new().unwrap());
+        tool.max_lines = 1_000;
+        tool.max_bytes = 50;
         let result = tool
             .call(ReadFileToolArgs {
                 file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
