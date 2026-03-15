@@ -4,6 +4,7 @@ use rig::{
     completion::{CompletionModel, CompletionResponse, Prompt},
     message::Message,
     providers::openrouter,
+    tool::Tool,
     tools::ThinkTool,
 };
 use std::{
@@ -17,7 +18,10 @@ mod test_utils;
 mod tools;
 mod utils;
 
-use crate::utils::{SnipTextFmtCtx, snip_long_text};
+use crate::{
+    tools::read_file::{ReadFileToolArgs, ReadFileToolOutput},
+    utils::{SnipTextFmtCtx, snip_long_text},
+};
 use crate::{
     tools::{read_file::ReadFileTool, safe_shell::SafeShellTool},
     utils::FilePermissions,
@@ -98,10 +102,23 @@ impl<'a, M: CompletionModel> PromptHook<M> for ToolHook<'a> {
         _internal_call_id: &str,
         args: &str,
     ) -> ToolCallHookAction {
-        println!(
-            "\n[{}] => CALLING TOOL: {}\n{}\n",
-            self.agent_name, tool_name, args
-        );
+        match tool_name {
+            ThinkTool::NAME => {
+                println!("\n[{}] Thinking...", self.agent_name);
+            }
+            ReadFileTool::NAME => {
+                if let Ok(args) = serde_json::from_str::<ReadFileToolArgs>(args) {
+                    println!("\n[{}] Reading file: {args}", self.agent_name)
+                }
+            }
+            _ => {
+                println!(
+                    "\n[{}] => CALLING TOOL: {}\n{}\n",
+                    self.agent_name, tool_name, args
+                );
+            }
+        }
+
         ToolCallHookAction::Continue
     }
 
@@ -113,20 +130,35 @@ impl<'a, M: CompletionModel> PromptHook<M> for ToolHook<'a> {
         args: &str,
         result: &str,
     ) -> HookAction {
-        println!(
-            "\n[{}] <= TOOL RESULT {}\n{}\n{}",
-            self.agent_name,
-            tool_name,
-            args,
-            snip_long_text(
-                Cow::from(result),
-                300,
-                |SnipTextFmtCtx {
-                     bytes,
-                     max_bytes: _,
-                 }| { format!("... (total {bytes}b)") }
-            )
-        );
+        match tool_name {
+            ThinkTool::NAME => {
+                println!("{}\n", result);
+            }
+            ReadFileTool::NAME => {
+                if let Ok(output) = serde_json::from_str::<ReadFileToolOutput>(result) {
+                    println!("{} bytes", output.content.len());
+                } else {
+                    // Failed to deserialize, so this is an error, just print it.
+                    println!("{}\n", result);
+                }
+            }
+            _ => {
+                println!(
+                    "\n[{}] <= TOOL RESULT {}\n{}\n{}",
+                    self.agent_name,
+                    tool_name,
+                    args,
+                    snip_long_text(
+                        Cow::from(result),
+                        300,
+                        |SnipTextFmtCtx {
+                             bytes,
+                             max_bytes: _,
+                         }| { format!("... (total {bytes}b)") }
+                    )
+                );
+            }
+        }
 
         HookAction::cont()
     }

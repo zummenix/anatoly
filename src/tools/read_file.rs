@@ -1,6 +1,9 @@
 use crate::utils::FilePermissions;
 use rig::{completion::ToolDefinition, tool::Tool};
-use std::io::{BufRead, BufReader};
+use std::{
+    fmt::Display,
+    io::{BufRead, BufReader},
+};
 
 pub(crate) struct ReadFileTool {
     /// File permissions to check for access to a file.
@@ -37,7 +40,29 @@ pub(crate) struct ReadFileToolArgs {
     end_line: Option<usize>,
 }
 
-#[derive(Debug, serde::Serialize, schemars::JsonSchema)]
+impl Display for ReadFileToolArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.file_path)?;
+        match (self.start_line, self.end_line) {
+            (None, None) => Ok(()),
+            _ => {
+                f.write_str(" (")?;
+                match self.start_line {
+                    Some(n) => write!(f, "{}", n)?,
+                    None => f.write_str("1")?,
+                }
+                f.write_str("-")?;
+                match self.end_line {
+                    Some(n) => write!(f, "{}", n)?,
+                    None => f.write_str("EOF")?,
+                }
+                f.write_str(")")
+            }
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
 pub(crate) struct ReadFileToolOutput {
     /// The file content for the requested range.
     pub(crate) content: String,
