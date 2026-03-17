@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rig-core = "0.32.0"
-safe-chains = "0.65.0"
+rig-core = "0.33.0"
+safe-chains = "0.85.0"
 schemars = { version = "1.2.1", features = ["preserve_order"] }
 serde = "1.0.228"
 serde_json = { version = "1.0.149", features = ["preserve_order"] }
