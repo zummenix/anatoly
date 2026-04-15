@@ -1,8 +1,7 @@
 use rig::{
-    agent::{AgentBuilder, HookAction, PromptHook, ToolCallHookAction},
+    agent::{AgentBuilder, HookAction, PromptHook, PromptResponse, ToolCallHookAction},
     client::{CompletionClient, ProviderClient},
-    completion::{CompletionModel, CompletionResponse, Prompt},
-    message::Message,
+    completion::{CompletionModel, CompletionResponse, Message, Prompt, PromptError},
     providers::openrouter,
     tool::Tool,
     tools::ThinkTool,
@@ -67,13 +66,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut retrying_interval = 1;
         loop {
-            match code_assistant
+            let prompt_response: Result<PromptResponse, PromptError> = code_assistant
                 .prompt(prompt.trim())
-                .with_history(&mut history)
-                .await
-            {
+                .extended_details()
+                .await;
+            match prompt_response {
                 Ok(response) => {
-                    println!("\n\n---\n{response}\n---\n\n");
+                    let output = response.output;
+                    let usage = response.usage;
+                    println!("\n\n---\n{output}\n[{usage:?}]\n---\n\n");
+                    if let Some(messages) = response.messages {
+                        history.extend_from_slice(&messages);
+                    }
                     break;
                 }
                 Err(err) => {
