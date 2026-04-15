@@ -68,6 +68,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let prompt_response: Result<PromptResponse, PromptError> = code_assistant
                 .prompt(prompt.trim())
+                .with_history(history.clone())
                 .extended_details()
                 .await;
             match prompt_response {
@@ -82,9 +83,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(err) => {
                     eprintln!("{err}\n\nRetrying after: {retrying_interval}s");
-                    let mut interval =
-                        tokio::time::interval(std::time::Duration::from_secs(retrying_interval));
-                    interval.tick().await;
+                    tokio::time::sleep(std::time::Duration::from_secs(retrying_interval)).await;
                     retrying_interval += 1;
                     continue;
                 }
@@ -131,7 +130,7 @@ impl<'a, M: CompletionModel> PromptHook<M> for ToolHook<'a> {
         tool_name: &str,
         _tool_call_id: Option<String>,
         _internal_call_id: &str,
-        args: &str,
+        _args: &str,
         result: &str,
     ) -> HookAction {
         match tool_name {
@@ -148,10 +147,9 @@ impl<'a, M: CompletionModel> PromptHook<M> for ToolHook<'a> {
             }
             _ => {
                 println!(
-                    "\n[{}] <= TOOL RESULT {}\n{}\n{}",
+                    "\n[{}] <= TOOL RESULT {}\n{}",
                     self.agent_name,
                     tool_name,
-                    args,
                     snip_long_text(
                         Cow::from(result),
                         300,
