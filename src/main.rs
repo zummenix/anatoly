@@ -38,7 +38,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let file_permissions = FilePermissions::new()?;
 
-    let client = openrouter::Client::from_env();
+    let client = openrouter::Client::from_env()
+        .unwrap_or_else(|e| panic!("Failed to create OpenRouter client: {e}"));
     let model_name = std::env::var("OPENROUTER_MODEL_NAME").expect("OPENROUTER_MODEL_NAME not set");
     let llm = client.completion_model(model_name);
 
