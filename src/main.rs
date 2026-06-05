@@ -26,6 +26,8 @@ use crate::{
     utils::FilePermissions,
 };
 
+const CODE_ASSISTANT_PREAMBLE: &str = include_str!("prompts/code_assistant_preamble.md");
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
@@ -47,7 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .name("Code Assistant")
         .max_tokens(1024)
         .default_max_turns(100)
-        .preamble("You are code assistant helping user explore codebases and to devise the best solutions. Use the tools provided to answer user's question.")
+        .preamble(CODE_ASSISTANT_PREAMBLE)
         .hook(ToolHook {
             agent_name: "Code Assistant",
         })
