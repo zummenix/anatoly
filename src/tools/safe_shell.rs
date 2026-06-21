@@ -43,7 +43,11 @@ impl Tool for SafeShellTool {
 }
 
 fn run_safe_shell_cmd(command: &str) -> Result<String, SafeShellToolError> {
-    if !safe_chains::is_safe_command(command) {
+    let is_read_only_command = matches!(
+        safe_chains::command_verdict(command),
+        safe_chains::Verdict::Allowed(level) if level <= safe_chains::SafetyLevel::SafeRead
+    );
+    if !is_read_only_command {
         return Err(SafeShellToolError::CommandIsNotAllowed(String::from(
             command,
         )));
