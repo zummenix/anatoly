@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 rig = { package = "rig-core", version = "0.37.0" }
-safe-chains = "0.203.0"
+safe-chains = "0.204.0"
 schemars = { version = "1.2.1", features = ["preserve_order"] }
 serde = "1.0.228"
 serde_json = { version = "1.0.150", features = ["preserve_order"] }
