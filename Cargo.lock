@@ -1671,13 +1671,14 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "safe-chains"
-version = "0.204.0"
+version = "0.208.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c15b0fda20c9f54b354c774593d3fb3029551c99457581d53c5a45218d3ed4f"
+checksum = "52ad9865b5b86643291bcab832ae0b92c1387d2cf32ce8cfb6477d410c9d81c3"
 dependencies = [
  "clap",
  "serde",
  "serde_json",
+ "sha2",
  "shell-words",
  "toml",
  "winnow 0.7.15",
@@ -1824,6 +1825,17 @@ name = "sha1"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3bf829a2d51ab4a5ddf1352d8470c140cadc8301b2ae1789db023f01cedd6ba"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures",
