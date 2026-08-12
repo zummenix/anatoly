@@ -1671,9 +1671,9 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "safe-chains"
-version = "0.219.1"
+version = "0.223.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "95ad66f608913a0b14df2633d17057b935d03380d98dae941f5031578fe761ef"
+checksum = "0b00dde362fa77e4d8e8a5610acd443bec84fe89b478baa5d6d5bcb32e50db5b"
 dependencies = [
  "clap",
  "serde",
