@@ -9,22 +9,23 @@ use rig::{
 use std::{
     borrow::Cow,
     io::{self, Write},
+    sync::Arc,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+mod container;
+mod session;
 #[cfg(test)]
 mod test_utils;
 mod tools;
 mod utils;
 
 use crate::{
-    tools::read_file::{ReadFileToolArgs, ReadFileToolOutput},
-    utils::{SnipTextFmtCtx, snip_long_text},
+    tools::read_file::{ReadFileTool, ReadFileToolArgs, ReadFileToolOutput},
+    tools::shell::{ShellTool, shell_timeout},
+    utils::{FilePermissions, SnipTextFmtCtx, snip_long_text},
 };
-use crate::{
-    tools::{read_file::ReadFileTool, safe_shell::SafeShellTool},
-    utils::FilePermissions,
-};
+use session::Session;
 
 const CODE_ASSISTANT_PREAMBLE: &str = include_str!("prompts/code_assistant_preamble.md");
 
@@ -38,12 +39,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    let file_permissions = FilePermissions::new()?;
+    let cwd = std::env::current_dir()?;
+    let session = Arc::new(Session::start(&cwd)?);
+    let file_permissions = FilePermissions::with_root(session.sandbox_dir.clone())?;
+
+    // SIGINT does not run destructors, so shutdown must be explicit.
+    {
+        let session = Arc::clone(&session);
+        tokio::spawn(async move {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => {
+                    session.shutdown();
+                    std::process::exit(130);
+                }
+                Err(err) => eprintln!("Failed to listen for Ctrl-C: {err}"),
+            }
+        });
+    }
 
     let client = openrouter::Client::from_env()
         .unwrap_or_else(|e| panic!("Failed to create OpenRouter client: {e}"));
     let model_name = std::env::var("OPENROUTER_MODEL_NAME").expect("OPENROUTER_MODEL_NAME not set");
     let llm = client.completion_model(model_name);
+
+    let shell_tool = ShellTool::new(
+        session.runtime.clone(),
+        session.container_name.clone(),
+        shell_timeout(),
+    );
 
     let code_assistant = AgentBuilder::new(llm)
         .name("Code Assistant")
@@ -55,7 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .tool(ThinkTool)
         .tool(ReadFileTool::new(file_permissions))
-        .tool(SafeShellTool)
+        .tool(shell_tool)
         .build();
 
     println!("Good day, sir! What can I help you with?\nCtrl-C to exit\n");
@@ -65,7 +88,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("> ");
         io::stdout().flush()?;
         let mut prompt = String::new();
-        io::stdin().read_line(&mut prompt)?;
+        let bytes_read = io::stdin().read_line(&mut prompt)?;
+        if bytes_read == 0 {
+            // EOF (Ctrl-D).
+            break;
+        }
 
         let mut retrying_interval = 1;
         loop {
@@ -93,6 +120,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    session.shutdown();
+    Ok(())
 }
 
 #[derive(Clone)]

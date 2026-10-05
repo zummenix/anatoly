@@ -42,11 +42,12 @@ pub(crate) struct FilePermissions {
 }
 
 impl FilePermissions {
+    #[cfg(test)]
     pub(crate) fn new() -> Result<Self, io::Error> {
         Self::with_root(std::env::current_dir()?)
     }
 
-    fn with_root(root: PathBuf) -> Result<Self, io::Error> {
+    pub(crate) fn with_root(root: PathBuf) -> Result<Self, io::Error> {
         Ok(Self {
             canonical_root: root.canonicalize()?,
         })
