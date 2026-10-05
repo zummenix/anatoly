@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
-use std::process::{Command as StdCommand, Output};
+use std::process::{Command as StdCommand, Output, Stdio};
 use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command as TokioCommand;
 
 /// Default sandbox image tag. Pinned on purpose (no `:latest`).
 pub(crate) const DEFAULT_SANDBOX_IMAGE: &str = "anatoly-sandbox:0.1";
+
+const MAX_EXEC_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// Label used to associate a container with the host repository it serves.
 const REPO_LABEL: &str = "anatoly.repo";
@@ -266,22 +269,35 @@ impl ContainerRuntime {
         let argv = exec_argv(self.kind.binary(), name, cmd);
         let mut command = TokioCommand::new(&argv[0]);
         command.args(&argv[1..]);
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
         // Cancellation (timeout) must not leave the exec running.
         command.kill_on_drop(true);
 
-        let output = tokio::time::timeout(timeout, command.output())
-            .await
-            .map_err(|_| ContainerError::TimedOut(timeout.as_secs()))?
-            .map_err(|source| ContainerError::Io {
-                rt: self.kind.binary(),
-                source,
-            })?;
+        let mut child = command.spawn().map_err(|source| ContainerError::Io {
+            rt: self.kind.binary(),
+            source,
+        })?;
+        let stdout = child.stdout.take().expect("stdout is piped");
+        let stderr = child.stderr.take().expect("stderr is piped");
+        let (stdout, stderr, status) = tokio::time::timeout(timeout, async {
+            tokio::try_join!(
+                read_capped(stdout, MAX_EXEC_OUTPUT_BYTES),
+                read_capped(stderr, MAX_EXEC_OUTPUT_BYTES),
+                child.wait(),
+            )
+        })
+        .await
+        .map_err(|_| ContainerError::TimedOut(timeout.as_secs()))?
+        .map_err(|source| ContainerError::Io {
+            rt: self.kind.binary(),
+            source,
+        })?;
 
         Ok(ExecOutput {
-            status: output.status.code(),
-            success: output.status.success(),
-            stdout: output.stdout,
-            stderr: output.stderr,
+            status: status.code(),
+            success: status.success(),
+            stdout,
+            stderr,
         })
     }
 
@@ -333,6 +349,24 @@ impl ContainerRuntime {
     }
 }
 
+async fn read_capped<R: AsyncRead + Unpin>(
+    mut reader: R,
+    max_bytes: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(max_bytes.min(8192));
+    let mut buffer = [0; 8192];
+    loop {
+        let bytes_read = reader.read(&mut buffer).await?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let remaining = max_bytes.saturating_sub(output.len());
+        output.extend_from_slice(&buffer[..bytes_read.min(remaining)]);
+    }
+    Ok(output)
+}
+
 /// Probes `ANATOLY_RUNTIME` handling; kept public-in-crate for tests.
 pub(crate) fn probe(kind: RuntimeKind) -> Result<(), String> {
     let output = StdCommand::new(kind.binary()).arg("version").output();
@@ -382,6 +416,25 @@ pub(crate) fn env_nonempty(key: &str) -> Option<String> {
 mod tests {
     use super::*;
     use insta::assert_snapshot;
+    use tokio::io::{AsyncWriteExt, duplex};
+
+    #[tokio::test]
+    async fn capped_output_is_drained_after_limit() {
+        let (mut writer, reader) = duplex(16);
+        let input = vec![b'x'; MAX_EXEC_OUTPUT_BYTES * 2];
+        let captured = tokio::time::timeout(Duration::from_secs(2), async {
+            let (write_result, captured) = tokio::join!(
+                async move { writer.write_all(&input).await },
+                read_capped(reader, 32)
+            );
+            write_result.expect("write test output");
+            captured.expect("read test output")
+        })
+        .await
+        .expect("reader continues draining after reaching its cap");
+
+        assert_eq!(captured, vec![b'x'; 32]);
+    }
 
     fn sample_spec() -> RunSpec {
         RunSpec {
