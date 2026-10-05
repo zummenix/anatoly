@@ -246,11 +246,14 @@ mod tests {
         let path = file_env.write_file("hello.txt", "hi".as_bytes());
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let err = tool
-            .call(&mut ToolContext::new(), ReadFileToolArgs {
-                file_path: path.to_string_lossy().into(),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: path.to_string_lossy().into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect_err("tool failure");
         assert_snapshot!(err, @"Failed to read file '[TEMP_DIR]/hello.txt', IO Error: 'Access to paths outside the workspace is not allowed'");
@@ -260,11 +263,14 @@ mod tests {
     async fn read_file_does_not_exist() {
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let err = tool
-            .call(&mut ToolContext::new(), ReadFileToolArgs {
-                file_path: String::from("abba.txt"),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("abba.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect_err("tool failure");
         let ReadFileToolError::FailedToReadFile(file_path, io_error) = err;
@@ -276,11 +282,14 @@ mod tests {
     async fn read_file_full() {
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let result = tool
-            .call(&mut ToolContext::new(), ReadFileToolArgs {
-                file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect("tool success");
         assert_eq!(result.truncated, None);
@@ -305,11 +314,14 @@ mod tests {
     async fn read_file_line_range() {
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let result = tool
-            .call(&mut ToolContext::new(), ReadFileToolArgs {
-                file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
-                start_line: Some(2),
-                end_line: Some(4),
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
+                    start_line: Some(2),
+                    end_line: Some(4),
+                },
+            )
             .await
             .expect("tool success");
         assert_eq!(result.truncated, None);
@@ -328,11 +340,14 @@ mod tests {
         tool.max_lines = 3;
         tool.max_bytes = 100_000;
         let result = tool
-            .call(&mut ToolContext::new(), ReadFileToolArgs {
-                file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect("tool success");
         assert_eq!(result.truncated, Some(true));
@@ -351,11 +366,14 @@ mod tests {
         tool.max_lines = 1_000;
         tool.max_bytes = 50;
         let result = tool
-            .call(&mut ToolContext::new(), ReadFileToolArgs {
-                file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect("tool success");
         assert_eq!(result.truncated, Some(true));
