@@ -4,6 +4,7 @@ use rig::{
         DispatchEvent, HookContext, OutcomeAction, OutcomeEvent, PromptResponse,
     },
     completion::{Message, PromptError},
+    core::{DynModel, operation::Completion},
     effect::EffectKind,
     providers::openrouter,
     tool::{Tool, builtin::ThinkTool},
@@ -77,15 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // request history before each completion call, letting us resume from there.
     let progress = Arc::new(Mutex::new(Vec::<Message>::new()));
 
-    let code_assistant = AgentBuilder::new(llm)
-        .name("Code Assistant")
-        .max_tokens(1024)
-        .default_max_turns(100)
-        .preamble(CODE_ASSISTANT_PREAMBLE)
-        .add_hook(ToolHook {
-            agent_name: "Code Assistant",
-            progress: Arc::clone(&progress),
-        })
+    let code_assistant = agent_builder(llm, Arc::clone(&progress))
         .tool(ThinkTool)
         .tool(ReadFileTool::new(file_permissions))
         .tool(shell_tool)
@@ -124,6 +117,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     session.shutdown();
     Ok(())
+}
+
+/// Builds the configured agent without tools. The CLI and the end-to-end tests
+/// share this so the tests drive the real rig loop under production wiring;
+/// callers add their own tools (mock tools in tests) and call `.build()`.
+fn agent_builder(
+    model: impl Into<DynModel<Completion>>,
+    progress: Arc<Mutex<Vec<Message>>>,
+) -> AgentBuilder {
+    AgentBuilder::new(model)
+        .name("Code Assistant")
+        .max_tokens(1024)
+        .default_max_turns(100)
+        .preamble(CODE_ASSISTANT_PREAMBLE)
+        .add_hook(ToolHook {
+            agent_name: "Code Assistant",
+            progress,
+        })
 }
 
 /// Runs `attempt` until it succeeds, resuming from the furthest progress the
@@ -284,9 +295,14 @@ mod tests {
     use super::*;
     use rig::{
         completion::Usage,
-        error::ProviderError,
-        message::{CallId, ToolName},
+        error::{ErrorKind, ProviderError},
+        message::{
+            AssistantContent, CallId, ToolCall, ToolFunction, ToolName, ToolResultContent,
+            UserContent,
+        },
+        test_utils::{MockAddTool, MockCompletionModel, MockTurn},
     };
+    use serde_json::json;
 
     fn user(text: &str) -> Message {
         Message::user(text)
@@ -306,6 +322,37 @@ mod tests {
 
     fn provider_error() -> PromptError {
         PromptError::CompletionError(ProviderError::Response("provider exploded".into()))
+    }
+
+    /// The assistant turn the rig `add` mock tool call deserializes to.
+    fn assistant_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> Message {
+        Message::Assistant {
+            id: None,
+            content: vec![AssistantContent::ToolCall(ToolCall::from_wire(
+                id,
+                ToolFunction::new(ToolName::new(name).expect("non-empty tool name"), arguments),
+            ))],
+        }
+    }
+
+    /// The tool result the rig `add` mock tool commits. Its `i32` output is a
+    /// serializable non-string, so it lands as structured JSON rather than text.
+    fn add_tool_result(id: &str, value: i64) -> Message {
+        Message::User {
+            content: vec![UserContent::tool_result(
+                CallId::from_wire(id),
+                ToolName::new("add").expect("non-empty tool name"),
+                vec![ToolResultContent::json(json!(value))],
+            )],
+        }
+    }
+
+    /// The history rig actually sends: the preamble as a leading system message,
+    /// then the tool hook's snapshot. Source: `run::prepare::prepare_request`.
+    fn with_preamble(messages: impl IntoIterator<Item = Message>) -> Vec<Message> {
+        std::iter::once(Message::system(CODE_ASSISTANT_PREAMBLE))
+            .chain(messages)
+            .collect()
     }
 
     #[test]
@@ -461,5 +508,264 @@ mod tests {
             run_with_retries(vec![], user("task"), attempt, no_snapshot).await;
 
         assert_eq!(history, vec![user("task"), assistant("done")]);
+    }
+
+    // -- End-to-end tests over rig's real agent loop -------------------------
+    //
+    // The tests above hand-build `PromptResponse`s and `attempt` closures, so
+    // they exercise *our* code but not rig's agent loop. These drive that loop
+    // through rig's scripted `MockCompletionModel` and assert the internals our
+    // retry/resume logic relies on, so a future rig release that breaks them
+    // fails loudly instead of silently degrading salvage.
+
+    #[tokio::test(start_paused = true)]
+    async fn e2e_happy_path_transcript_and_request_snapshot_match_the_model_call() {
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("call_1", "add", json!({ "x": 20, "y": 22 })),
+            MockTurn::text("done"),
+        ]);
+        let inspector = model.clone();
+        let progress = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let agent = agent_builder(model, Arc::clone(&progress))
+            .tool(MockAddTool)
+            .build();
+
+        let input = vec![user("earlier"), assistant("earlier answer")];
+        let (history, response) = run_with_retries(
+            input.clone(),
+            user("add 20 and 22"),
+            |pending, history| {
+                let agent = &agent;
+                async move { agent.prompt(pending).history(history).await }
+            },
+            || progress.lock().unwrap().clone(),
+        )
+        .await;
+
+        let transcript = vec![
+            user("add 20 and 22"),
+            assistant_tool_call("call_1", "add", json!({ "x": 20, "y": 22 })),
+            add_tool_result("call_1", 42),
+            assistant("done"),
+        ];
+
+        // Invariant #2: `response.messages` is the run transcript — the prompt,
+        // accepted assistant turns, and committed tool results — excluding the
+        // input history. Source: rig-agent/src/run/response.rs,
+        // `PromptResponse::messages`.
+        assert_eq!(response.messages.as_deref(), Some(transcript.as_slice()));
+        assert_eq!(
+            history,
+            input
+                .iter()
+                .cloned()
+                .chain(transcript.iter().cloned())
+                .collect::<Vec<_>>(),
+            "input history plus the run transcript, committed exactly once"
+        );
+
+        let requests = inspector.requests();
+        assert_eq!(requests.len(), 2, "one model call per run turn");
+
+        let mut after_prompt = input.clone();
+        after_prompt.push(user("add 20 and 22"));
+
+        let mut after_tool = after_prompt.clone();
+        after_tool.push(assistant_tool_call(
+            "call_1",
+            "add",
+            json!({ "x": 20, "y": 22 }),
+        ));
+        after_tool.push(add_tool_result("call_1", 42));
+
+        // Invariant #1: each request's `chat_history` is the hook snapshot
+        // (`event.history + [event.prompt]`) with the preamble system message in
+        // front, so the hook sees the complete request minus the preamble.
+        // Sources: rig-agent/src/run/mod.rs (the `CallModel` arm's
+        // `split_last` + `build_history_for_request`) and
+        // rig-agent/src/run/prepare.rs (the preamble becomes the leading
+        // `Message::system`).
+        assert_eq!(with_preamble(after_prompt), requests[0].chat_history);
+        assert_eq!(with_preamble(after_tool.clone()), requests[1].chat_history);
+
+        // The hook's `progress` holds the last request snapshot it took.
+        assert_eq!(progress.lock().unwrap().clone(), after_tool);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn e2e_fail_then_resume_replays_the_tool_turn_once_from_the_snapshot() {
+        // Turn 1 answers with a tool call; the run's second completion call
+        // hits the scripted provider error; the third call answers the resumed
+        // run. `run_with_retries` must salvage turn 1 from the hook snapshot and
+        // replay it exactly once.
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("call_1", "add", json!({ "x": 20, "y": 22 })),
+            MockTurn::error("provider exploded"),
+            MockTurn::text("42"),
+        ]);
+        let inspector = model.clone();
+        let progress = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let agent = agent_builder(model, Arc::clone(&progress))
+            .tool(MockAddTool)
+            .build();
+
+        let input = vec![user("earlier"), assistant("earlier answer")];
+        let attempts = Arc::new(Mutex::new(0usize));
+        let attempt_calls = Arc::clone(&attempts);
+        let agent_ref = &agent;
+        let attempt = move |pending: Message, history: Vec<Message>| {
+            let attempt_calls = Arc::clone(&attempt_calls);
+            async move {
+                *attempt_calls.lock().unwrap() += 1;
+                agent_ref.prompt(pending).history(history).await
+            }
+        };
+
+        let (history, response) =
+            run_with_retries(input.clone(), user("add 20 and 22"), attempt, || {
+                progress.lock().unwrap().clone()
+            })
+            .await;
+
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            2,
+            "the provider failure must be retried once"
+        );
+        assert_eq!(response.output, "42");
+
+        let transcript = [
+            user("add 20 and 22"),
+            assistant_tool_call("call_1", "add", json!({ "x": 20, "y": 22 })),
+            add_tool_result("call_1", 42),
+            assistant("42"),
+        ];
+        // Invariant #4: the completed tool turn survives the failure exactly
+        // once — no duplication, no loss.
+        assert_eq!(
+            history,
+            input
+                .iter()
+                .cloned()
+                .chain(transcript.iter().cloned())
+                .collect::<Vec<_>>()
+        );
+
+        // Invariant #3/#4: a provider failure carries no history, so recovery
+        // comes solely from the hook. The resumed request re-sends the salvaged
+        // prefix — the committed tool result as the pending prompt — instead of
+        // restarting from the bare prompt.
+        let requests = inspector.requests();
+        assert_eq!(requests.len(), 3);
+
+        let mut salvaged = input.clone();
+        salvaged.push(user("add 20 and 22"));
+        salvaged.push(assistant_tool_call(
+            "call_1",
+            "add",
+            json!({ "x": 20, "y": 22 }),
+        ));
+        salvaged.push(add_tool_result("call_1", 42));
+
+        assert_eq!(with_preamble(salvaged.clone()), requests[1].chat_history);
+        assert_eq!(
+            with_preamble(salvaged),
+            requests[2].chat_history,
+            "resume must replay the salvaged prefix (tool result included), not restart"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn e2e_provider_failure_carries_no_history_and_the_hook_is_the_only_record() {
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("call_1", "add", json!({ "x": 1, "y": 2 })),
+            MockTurn::error("provider exploded"),
+        ]);
+        let progress = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let agent = agent_builder(model, Arc::clone(&progress))
+            .tool(MockAddTool)
+            .build();
+
+        let err = agent
+            .prompt(user("add 1 and 2"))
+            .history(Vec::<Message>::new())
+            .await
+            .expect_err("the second completion call fails");
+
+        // Invariant #3: a provider failure carries no run history, so it cannot
+        // be salvaged and only the hook snapshot can recover the tool turn.
+        // Under the runtime's effect bus the failure surfaces as
+        // `PromptError::Report` with `ErrorKind::Provider` (the `ProviderError`
+        // wrapped in an `ErrorReport`), rather than the bare
+        // `PromptError::CompletionError` the enum alone suggests. Sources:
+        // rig-agent/src/agent/engine.rs (`streaming_error_into_prompt` and the
+        // unary `run_model_turn`'s `CompletionDispatchError::Failed`) and
+        // rig-agent/src/run/response.rs (`enum PromptError`).
+        match &err {
+            PromptError::Report(report) => assert_eq!(report.kind, ErrorKind::Provider),
+            other => panic!("expected a bus-wrapped provider failure, got {other:?}"),
+        }
+        assert!(
+            !matches!(
+                err,
+                PromptError::MaxTurnsError { .. }
+                    | PromptError::PromptCancelled { .. }
+                    | PromptError::UnknownToolCall { .. }
+            ),
+            "the failure must be one of the variants that carries no history"
+        );
+
+        // The hook still recorded the completed tool turn: the only salvage
+        // source available after the failure.
+        assert_eq!(
+            progress.lock().unwrap().clone(),
+            vec![
+                user("add 1 and 2"),
+                assistant_tool_call("call_1", "add", json!({ "x": 1, "y": 2 })),
+                add_tool_result("call_1", 3),
+            ]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn e2e_max_turns_error_carries_the_canonical_history() {
+        let model = MockCompletionModel::from_turns([
+            MockTurn::tool_call("call_1", "add", json!({ "x": 1, "y": 2 })),
+            MockTurn::text("42"),
+        ]);
+        let progress = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let agent = agent_builder(model, Arc::clone(&progress))
+            .default_max_turns(1)
+            .tool(MockAddTool)
+            .build();
+
+        let err = agent
+            .prompt(user("add 1 and 2"))
+            .history(Vec::<Message>::new())
+            .await
+            .expect_err("the run exceeds its single-turn budget");
+
+        // Invariant #5: unlike a provider failure, `MaxTurnsError` carries
+        // `chat_history`, a secondary salvage source. Source:
+        // rig-agent/src/run/response.rs, `enum PromptError`.
+        match err {
+            PromptError::MaxTurnsError {
+                max_turns,
+                chat_history,
+                prompt,
+            } => {
+                assert_eq!(max_turns, 1);
+                assert_eq!(
+                    chat_history,
+                    vec![
+                        user("add 1 and 2"),
+                        assistant_tool_call("call_1", "add", json!({ "x": 1, "y": 2 })),
+                        add_tool_result("call_1", 3),
+                    ]
+                );
+                assert_eq!(prompt, add_tool_result("call_1", 3));
+            }
+            other => panic!("expected MaxTurnsError, got {other:?}"),
+        }
     }
 }
