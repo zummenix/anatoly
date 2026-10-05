@@ -87,7 +87,14 @@ impl RunSpec {
 /// environment, and never any host secret).
 pub(crate) fn run_argv(rt: &str, spec: &RunSpec) -> Vec<String> {
     let sandbox = spec.sandbox_dir.to_string_lossy().into_owned();
-    vec![
+    // Rootless podman maps the container uid to a subuid unless told to keep
+    // the host uid, which would make the bind mount unwritable.
+    let userns: &[String] = if rt == RuntimeKind::Podman.binary() {
+        &["--userns=keep-id".to_string()]
+    } else {
+        &[]
+    };
+    let mut argv = vec![
         rt.to_string(),
         "run".to_string(),
         "-d".to_string(),
@@ -129,7 +136,10 @@ pub(crate) fn run_argv(rt: &str, spec: &RunSpec) -> Vec<String> {
         spec.image.clone(),
         "sleep".to_string(),
         "infinity".to_string(),
-    ]
+    ];
+    let user_idx = argv.iter().position(|a| a == "--user").unwrap_or(0);
+    argv.splice(user_idx..user_idx, userns.iter().cloned());
+    argv
 }
 
 pub(crate) fn exec_argv(rt: &str, name: &str, cmd: &str) -> Vec<String> {
@@ -411,6 +421,7 @@ mod tests {
           "4",
           "--security-opt",
           "no-new-privileges:true",
+          "--userns=keep-id",
           "--user",
           "1000:1000",
           "--network",
@@ -446,7 +457,11 @@ mod tests {
         let docker = sample_spec().argv(RuntimeKind::Docker);
         assert_eq!(podman[0], "podman");
         assert_eq!(docker[0], "docker");
-        assert_eq!(podman[1..], docker[1..]);
+        let podman: Vec<_> = podman[1..]
+            .iter()
+            .filter(|a| *a != "--userns=keep-id")
+            .collect();
+        assert_eq!(podman, docker[1..].iter().collect::<Vec<_>>());
     }
 
     #[test]
