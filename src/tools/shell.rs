@@ -71,10 +71,16 @@ impl Tool for ShellTool {
             let stdout = String::from_utf8_lossy(&output.stdout);
             Ok(snip_long_text(stdout, 10_000, snip_message_fmt).into())
         } else {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stdout = snip_long_text(stdout, 5000, snip_message_fmt);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            Err(ShellToolError::Failure(
-                snip_long_text(stderr, 5000, snip_message_fmt).into(),
-            ))
+            let stderr = snip_long_text(stderr, 5000, snip_message_fmt);
+            Err(ShellToolError::Failure(format!(
+                "Exit status: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output
+                    .status
+                    .map_or_else(|| "unknown".to_string(), |status| status.to_string())
+            )))
         }
     }
 }
