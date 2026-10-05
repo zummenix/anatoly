@@ -3,7 +3,7 @@ use rig::{
         AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, DispatchAction,
         DispatchEvent, HookContext, OutcomeAction, OutcomeEvent, PromptResponse,
     },
-    completion::{Message, PromptError},
+    completion::{Message, PromptError, Usage},
     core::{DynModel, operation::Completion},
     effect::EffectKind,
     providers::openrouter,
@@ -99,24 +99,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let pending_prompt = Message::from(prompt.trim());
         let agent = &code_assistant;
-        let (new_history, response) = run_with_retries(
-            history,
-            pending_prompt,
-            |pending_prompt, history| async move {
-                agent.prompt(pending_prompt).history(history).await
-            },
-            || progress.lock().unwrap().clone(),
-        )
-        .await;
+        let (new_history, response) =
+            run_with_retries(
+                history,
+                pending_prompt,
+                |pending_prompt, history| async move {
+                    agent.prompt(pending_prompt).history(history).await
+                },
+                || progress.lock().unwrap().clone(),
+            )
+            .await;
         history = new_history;
 
         let output = response.output;
-        let usage = response.usage;
-        println!("\n\n---\n{output}\n[{usage:?}]\n---\n\n");
+        println!("\n\n---\n{output}\n\n---\n\n");
+
+        if let Some(usage) = format_usage(response.usage) {
+            println!("{usage}\n\n");
+        }
     }
 
     session.shutdown();
     Ok(())
+}
+
+fn format_usage(usage: Usage) -> Option<String> {
+    if !usage.is_reported() {
+        return None;
+    }
+
+    let mut result = String::new();
+    result.push_str("  Tokens\n");
+    if let Some(input) = usage.input_tokens {
+        result.push_str("     in: ");
+        result.push_str(&input.to_string());
+        result.push('\n');
+    }
+    if let Some(output) = usage.output_tokens {
+        result.push_str("    out: ");
+        result.push_str(&output.to_string());
+        result.push('\n');
+    }
+    if let Some(cached) = usage.cached_input_tokens {
+        result.push_str(" cached: ");
+        result.push_str(&cached.to_string());
+        if let Some(input) = usage.input_tokens
+            && input > 0
+        {
+            let ratio = cached as f64 / input as f64;
+            result.push_str(&format!(" ({:.1}%)", ratio * 100.0));
+        }
+        result.push('\n');
+    }
+    Some(result)
 }
 
 /// Builds the configured agent without tools. The CLI and the end-to-end tests
@@ -367,7 +402,11 @@ mod tests {
         assert!(!resume_from_snapshot(&mut history, &mut pending, &equal));
         // Snapshot that is not a prefix of the committed history.
         let unrelated = vec![user("x"), assistant("y")];
-        assert!(!resume_from_snapshot(&mut history, &mut pending, &unrelated));
+        assert!(!resume_from_snapshot(
+            &mut history,
+            &mut pending,
+            &unrelated
+        ));
 
         assert_eq!(history, vec![user("a"), assistant("b")]);
         assert_eq!(pending, user("c"));
