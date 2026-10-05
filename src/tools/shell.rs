@@ -1,6 +1,6 @@
 use crate::container::{ContainerError, ContainerRuntime};
 use crate::utils::{SnipTextFmtCtx, snip_long_text};
-use rig::{completion::ToolDefinition, tool::Tool};
+use rig::tool::{Tool, ToolContext};
 use std::time::Duration;
 
 /// Runs commands inside the session's long-lived sandbox container.
@@ -42,18 +42,20 @@ impl Tool for ShellTool {
 
     type Output = String;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        let parameters = schemars::schema_for!(ShellToolArgs);
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description:
-                "Runs shell commands (cat, grep, find, git, ...) inside an isolated sandbox container."
-                    .to_string(),
-            parameters: serde_json::to_value(parameters).unwrap(),
-        }
+    fn description(&self) -> String {
+        "Runs shell commands (cat, grep, find, git, ...) inside an isolated sandbox container."
+            .to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(ShellToolArgs)).unwrap()
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let output = self
             .runtime
             .exec(&self.container, &args.cmd, self.timeout)
@@ -92,11 +94,11 @@ mod tests {
     use super::*;
     use insta::assert_snapshot;
 
-    #[tokio::test]
-    async fn tool_definition() {
+    #[test]
+    fn tool_definition() {
         let runtime = ContainerRuntime::for_kind(crate::container::RuntimeKind::Podman);
         let tool = ShellTool::new(runtime, "anatoly-1".to_string(), Duration::from_secs(300));
-        let def = tool.definition(String::from("prompt")).await;
+        let def = rig::tool::tool_definition(&tool);
         assert_snapshot!(serde_json::to_string_pretty(&def).unwrap(), @r#"
         {
           "name": "shell",

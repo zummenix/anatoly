@@ -1,15 +1,19 @@
 use rig::{
-    agent::{AgentBuilder, HookAction, PromptHook, PromptResponse, ToolCallHookAction},
-    client::{CompletionClient, ProviderClient},
-    completion::{CompletionModel, CompletionResponse, Message, Prompt, PromptError},
+    agent::{
+        AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, DispatchAction,
+        DispatchEvent, HookContext, OutcomeAction, OutcomeEvent, PromptResponse,
+    },
+    completion::{Message, PromptError},
+    effect::EffectKind,
     providers::openrouter,
-    tool::Tool,
-    tools::ThinkTool,
+    tool::{Tool, builtin::ThinkTool},
 };
 use std::{
     borrow::Cow,
+    future::Future,
     io::{self, Write},
-    sync::Arc,
+    sync::{Arc, Mutex},
+    time::Duration,
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -57,10 +61,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    let client = openrouter::Client::from_env()
+    let client = openrouter::from_env()
         .unwrap_or_else(|e| panic!("Failed to create OpenRouter client: {e}"));
     let model_name = std::env::var("OPENROUTER_MODEL_NAME").expect("OPENROUTER_MODEL_NAME not set");
-    let llm = client.completion_model(model_name);
+    let llm = client.completion(model_name);
 
     let shell_tool = ShellTool::new(
         session.runtime.clone(),
@@ -68,13 +72,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         shell_timeout(),
     );
 
+    // rig-core does not attach the in-flight messages to a completion error, so a
+    // failed attempt loses every tool turn it made. The hook snapshots the full
+    // request history before each completion call, letting us resume from there.
+    let progress = Arc::new(Mutex::new(Vec::<Message>::new()));
+
     let code_assistant = AgentBuilder::new(llm)
         .name("Code Assistant")
         .max_tokens(1024)
         .default_max_turns(100)
         .preamble(CODE_ASSISTANT_PREAMBLE)
-        .hook(ToolHook {
+        .add_hook(ToolHook {
             agent_name: "Code Assistant",
+            progress: Arc::clone(&progress),
         })
         .tool(ThinkTool)
         .tool(ReadFileTool::new(file_permissions))
@@ -94,119 +104,362 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             break;
         }
 
-        let mut retrying_interval = 1;
-        loop {
-            let prompt_response: Result<PromptResponse, PromptError> = code_assistant
-                .prompt(prompt.trim())
-                .with_history(history.clone())
-                .extended_details()
-                .await;
-            match prompt_response {
-                Ok(response) => {
-                    let output = response.output;
-                    let usage = response.usage;
-                    println!("\n\n---\n{output}\n[{usage:?}]\n---\n\n");
-                    if let Some(messages) = response.messages {
-                        history.extend_from_slice(&messages);
-                    }
-                    break;
-                }
-                Err(err) => {
-                    eprintln!("{err}\n\nRetrying after: {retrying_interval}s");
-                    tokio::time::sleep(std::time::Duration::from_secs(retrying_interval)).await;
-                    retrying_interval += 1;
-                    continue;
-                }
-            }
-        }
+        let pending_prompt = Message::from(prompt.trim());
+        let agent = &code_assistant;
+        let (new_history, response) = run_with_retries(
+            history,
+            pending_prompt,
+            |pending_prompt, history| async move {
+                agent.prompt(pending_prompt).history(history).await
+            },
+            || progress.lock().unwrap().clone(),
+        )
+        .await;
+        history = new_history;
+
+        let output = response.output;
+        let usage = response.usage;
+        println!("\n\n---\n{output}\n[{usage:?}]\n---\n\n");
     }
 
     session.shutdown();
     Ok(())
 }
 
-#[derive(Clone)]
-struct ToolHook<'a> {
-    agent_name: &'a str,
+/// Runs `attempt` until it succeeds, resuming from the furthest progress the
+/// agent reached after each failure.
+///
+/// `attempt` is called with the pending message and the committed history.
+/// `snapshot` returns the hook's record of the last request's full history
+/// (input history plus the pending message); it recovers the tool turns a failed
+/// attempt produced but never returned to us.
+async fn run_with_retries<A, AF, S>(
+    mut history: Vec<Message>,
+    mut pending_prompt: Message,
+    mut attempt: A,
+    snapshot: S,
+) -> (Vec<Message>, PromptResponse)
+where
+    A: FnMut(Message, Vec<Message>) -> AF,
+    AF: Future<Output = Result<PromptResponse, PromptError>>,
+    S: Fn() -> Vec<Message>,
+{
+    let mut retrying_interval = 1;
+    loop {
+        match attempt(pending_prompt.clone(), history.clone()).await {
+            Ok(response) => {
+                if let Some(messages) = &response.messages {
+                    history.extend_from_slice(messages);
+                }
+                return (history, response);
+            }
+            Err(err) => {
+                eprintln!("{err}\n\nRetrying after: {retrying_interval}s");
+                if resume_from_snapshot(&mut history, &mut pending_prompt, &snapshot()) {
+                    eprintln!(
+                        "Resuming from saved progress ({} messages in history).",
+                        history.len()
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(retrying_interval)).await;
+                retrying_interval += 1;
+            }
+        }
+    }
 }
 
-impl<'a, M: CompletionModel> PromptHook<M> for ToolHook<'a> {
-    async fn on_tool_call(
-        &self,
-        tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
-        args: &str,
-    ) -> ToolCallHookAction {
-        match tool_name {
-            ThinkTool::NAME => {
-                println!("\n[{}] Thinking...", self.agent_name);
-            }
-            ReadFileTool::NAME => {
-                if let Ok(args) = serde_json::from_str::<ReadFileToolArgs>(args) {
-                    println!("\n[{}] Reading file: {args}", self.agent_name)
+/// Adopts the furthest progress recorded in `snapshot` into `history` and
+/// `pending_prompt`.
+///
+/// A snapshot is the committed history followed by the message being sent, so
+/// splitting off that last message yields a valid history prefix plus the prompt
+/// to resume with. Returns `true` when the snapshot extended the committed
+/// history. Shorter, equal, or unrelated snapshots are ignored so a stale record
+/// can never rewind or duplicate state.
+fn resume_from_snapshot(
+    history: &mut Vec<Message>,
+    pending_prompt: &mut Message,
+    snapshot: &[Message],
+) -> bool {
+    if snapshot.len() <= history.len() || !snapshot.starts_with(history) {
+        return false;
+    }
+    let (last, rest) = snapshot
+        .split_last()
+        .expect("snapshot is longer than history, so it is non-empty");
+    *history = rest.to_vec();
+    *pending_prompt = last.clone();
+    true
+}
+
+#[derive(Clone)]
+struct ToolHook {
+    agent_name: &'static str,
+    progress: Arc<Mutex<Vec<Message>>>,
+}
+
+impl AgentHook for ToolHook {
+    async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        if let EffectKind::ToolCall { name, args } = event.kind {
+            match name.as_str() {
+                ThinkTool::NAME => {
+                    println!("\n[{}] Thinking...", self.agent_name);
                 }
-            }
-            _ => {
-                println!(
-                    "\n[{}] => CALLING TOOL: {}\n{}\n",
-                    self.agent_name, tool_name, args
-                );
+                ReadFileTool::NAME => {
+                    if let Ok(args) = serde_json::from_str::<ReadFileToolArgs>(args) {
+                        println!("\n[{}] Reading file: {args}", self.agent_name)
+                    }
+                }
+                _ => {
+                    println!(
+                        "\n[{}] => CALLING TOOL: {}\n{}\n",
+                        self.agent_name, name, args
+                    );
+                }
             }
         }
 
-        ToolCallHookAction::Continue
+        DispatchAction::Proceed
     }
 
-    async fn on_tool_result(
-        &self,
-        tool_name: &str,
-        _tool_call_id: Option<String>,
-        _internal_call_id: &str,
-        _args: &str,
-        result: &str,
-    ) -> HookAction {
-        match tool_name {
-            ThinkTool::NAME => {
-                println!("{}\n", result);
+    async fn on_outcome(&self, _ctx: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if let Some(tool_name) = event.tool_name() {
+            let result = event
+                .tool_result()
+                .map(|result| result.output().render())
+                .unwrap_or_default();
+            match tool_name {
+                ThinkTool::NAME => {
+                    println!("{result}\n");
+                }
+                ReadFileTool::NAME => {
+                    if let Ok(output) = serde_json::from_str::<ReadFileToolOutput>(&result) {
+                        println!("{} bytes", output.content.len());
+                    } else {
+                        // Failed to deserialize, so this is an error, just print it.
+                        println!("{result}\n");
+                    }
+                }
+                _ => {
+                    println!(
+                        "\n[{}] <= TOOL RESULT {}\n{}",
+                        self.agent_name,
+                        tool_name,
+                        snip_long_text(
+                            Cow::from(result.as_str()),
+                            300,
+                            |SnipTextFmtCtx {
+                                 bytes,
+                                 max_bytes: _,
+                             }| { format!("... (total {bytes}b)") }
+                        )
+                    );
+                }
             }
-            ReadFileTool::NAME => {
-                if let Ok(output) = serde_json::from_str::<ReadFileToolOutput>(result) {
-                    println!("{} bytes", output.content.len());
+        }
+
+        OutcomeAction::Proceed
+    }
+
+    async fn on_completion_call(
+        &self,
+        _ctx: &HookContext,
+        event: CompletionCallEvent<'_>,
+    ) -> CompletionCallAction {
+        // Called before each completion request with the input history plus every
+        // message accumulated so far except the pending one. Together they form
+        // the exact request history, which is what we salvage on failure.
+        {
+            let mut progress = self.progress.lock().unwrap();
+            progress.clear();
+            progress.extend_from_slice(event.history);
+            progress.push(event.prompt.clone());
+        }
+        CompletionCallAction::Continue
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rig::{
+        completion::Usage,
+        error::ProviderError,
+        message::{CallId, ToolName},
+    };
+
+    fn user(text: &str) -> Message {
+        Message::user(text)
+    }
+
+    fn assistant(text: &str) -> Message {
+        Message::assistant(text)
+    }
+
+    fn tool_result(id: &str, text: &str) -> Message {
+        Message::tool_result(
+            CallId::from_wire(id),
+            ToolName::new("shell").expect("non-empty tool name"),
+            text,
+        )
+    }
+
+    fn provider_error() -> PromptError {
+        PromptError::CompletionError(ProviderError::Response("provider exploded".into()))
+    }
+
+    #[test]
+    fn resume_ignores_snapshots_that_do_not_extend_history() {
+        let mut history = vec![user("a"), assistant("b")];
+        let mut pending = user("c");
+
+        // Empty snapshot.
+        assert!(!resume_from_snapshot(&mut history, &mut pending, &[]));
+        // Snapshot equal to the committed history.
+        let equal = history.clone();
+        assert!(!resume_from_snapshot(&mut history, &mut pending, &equal));
+        // Snapshot that is not a prefix of the committed history.
+        let unrelated = vec![user("x"), assistant("y")];
+        assert!(!resume_from_snapshot(&mut history, &mut pending, &unrelated));
+
+        assert_eq!(history, vec![user("a"), assistant("b")]);
+        assert_eq!(pending, user("c"));
+    }
+
+    #[test]
+    fn resume_adopts_prefix_and_splits_off_pending_message() {
+        let mut history = vec![user("task")];
+        let mut pending = user("task");
+        let snapshot = vec![
+            user("task"),
+            assistant("calling shell"),
+            tool_result("call-1", "42"),
+        ];
+
+        assert!(resume_from_snapshot(&mut history, &mut pending, &snapshot));
+
+        assert_eq!(history, vec![user("task"), assistant("calling shell")]);
+        assert_eq!(pending, tool_result("call-1", "42"));
+    }
+
+    #[test]
+    fn resume_before_any_progress_keeps_history_and_prompt() {
+        let mut history = vec![user("earlier"), assistant("earlier answer")];
+        let mut pending = user("task");
+        let snapshot = vec![user("earlier"), assistant("earlier answer"), user("task")];
+
+        assert!(resume_from_snapshot(&mut history, &mut pending, &snapshot));
+
+        assert_eq!(history, vec![user("earlier"), assistant("earlier answer")]);
+        assert_eq!(pending, user("task"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_resumes_from_salvaged_progress_without_duplicating() {
+        let snapshot = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let calls = Arc::new(Mutex::new(0usize));
+
+        let attempt_snapshot = Arc::clone(&snapshot);
+        let attempt_calls = Arc::clone(&calls);
+        let attempt = move |_pending: Message, _history: Vec<Message>| {
+            let attempt_snapshot = Arc::clone(&attempt_snapshot);
+            let attempt_calls = Arc::clone(&attempt_calls);
+            async move {
+                let call = {
+                    let mut calls = attempt_calls.lock().unwrap();
+                    *calls += 1;
+                    *calls
+                };
+                if call == 1 {
+                    // The agent made a tool turn, then the provider failed.
+                    *attempt_snapshot.lock().unwrap() = vec![
+                        user("task"),
+                        assistant("calling shell"),
+                        tool_result("call-1", "42"),
+                    ];
+                    Err(provider_error())
                 } else {
-                    // Failed to deserialize, so this is an error, just print it.
-                    println!("{}\n", result);
+                    Ok(PromptResponse::new("done", Usage::default())
+                        .with_messages(vec![tool_result("call-1", "42"), assistant("done")]))
                 }
             }
-            _ => {
-                println!(
-                    "\n[{}] <= TOOL RESULT {}\n{}",
-                    self.agent_name,
-                    tool_name,
-                    snip_long_text(
-                        Cow::from(result),
-                        300,
-                        |SnipTextFmtCtx {
-                             bytes,
-                             max_bytes: _,
-                         }| { format!("... (total {bytes}b)") }
-                    )
-                );
+        };
+        let snapshot_reader = {
+            let snapshot = Arc::clone(&snapshot);
+            move || snapshot.lock().unwrap().clone()
+        };
+
+        let (history, response) =
+            run_with_retries(vec![], user("task"), attempt, snapshot_reader).await;
+
+        assert_eq!(*calls.lock().unwrap(), 2);
+        assert_eq!(response.output, "done");
+        assert_eq!(
+            history,
+            vec![
+                user("task"),
+                assistant("calling shell"),
+                tool_result("call-1", "42"),
+                assistant("done"),
+            ],
+            "salvaged tool turns must be kept exactly once"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_without_progress_reuses_original_prompt() {
+        let snapshot = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let calls = Arc::new(Mutex::new(0usize));
+
+        let attempt_snapshot = Arc::clone(&snapshot);
+        let attempt_calls = Arc::clone(&calls);
+        let attempt = move |_pending: Message, _history: Vec<Message>| {
+            let attempt_snapshot = Arc::clone(&attempt_snapshot);
+            let attempt_calls = Arc::clone(&attempt_calls);
+            async move {
+                let call = {
+                    let mut calls = attempt_calls.lock().unwrap();
+                    *calls += 1;
+                    *calls
+                };
+                if call == 1 {
+                    // Failure on the very first completion call: no tool progress.
+                    *attempt_snapshot.lock().unwrap() = vec![user("task")];
+                    Err(provider_error())
+                } else {
+                    Ok(PromptResponse::new("done", Usage::default())
+                        .with_messages(vec![user("task"), assistant("done")]))
+                }
             }
-        }
+        };
+        let snapshot_reader = {
+            let snapshot = Arc::clone(&snapshot);
+            move || snapshot.lock().unwrap().clone()
+        };
 
-        HookAction::cont()
+        let (history, _response) =
+            run_with_retries(vec![], user("task"), attempt, snapshot_reader).await;
+
+        assert_eq!(
+            history,
+            vec![user("task"), assistant("done")],
+            "a failure before any tool turn must not lose or duplicate the prompt"
+        );
     }
 
-    async fn on_completion_call(&self, _prompt: &Message, _history: &[Message]) -> HookAction {
-        HookAction::cont()
-    }
+    #[tokio::test(start_paused = true)]
+    async fn successful_attempt_commits_turn_messages_once() {
+        let attempt = |_pending: Message, _history: Vec<Message>| async move {
+            Ok::<_, PromptError>(
+                PromptResponse::new("done", Usage::default())
+                    .with_messages(vec![user("task"), assistant("done")]),
+            )
+        };
+        let no_snapshot = || Vec::<Message>::new();
 
-    async fn on_completion_response(
-        &self,
-        _prompt: &Message,
-        _response: &CompletionResponse<M::Response>,
-    ) -> HookAction {
-        HookAction::cont()
+        let (history, _response) =
+            run_with_retries(vec![], user("task"), attempt, no_snapshot).await;
+
+        assert_eq!(history, vec![user("task"), assistant("done")]);
     }
 }

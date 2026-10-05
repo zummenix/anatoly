@@ -1,5 +1,5 @@
 use crate::utils::FilePermissions;
-use rig::{completion::ToolDefinition, tool::Tool};
+use rig::tool::{Tool, ToolContext};
 use std::{
     fmt::Display,
     io::{BufRead, BufReader},
@@ -83,17 +83,19 @@ impl Tool for ReadFileTool {
 
     type Output = ReadFileToolOutput;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        let parameters = schemars::schema_for!(ReadFileToolArgs);
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Reads a file and returns its content with optional line range selection"
-                .to_string(),
-            parameters: serde_json::to_value(parameters).unwrap(),
-        }
+    fn description(&self) -> String {
+        "Reads a file and returns its content with optional line range selection".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(ReadFileToolArgs)).unwrap()
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         run_read_file(
             &args.file_path,
             args.start_line,
@@ -193,11 +195,10 @@ mod tests {
     use crate::test_utils::FileEnv;
     use insta::assert_snapshot;
 
-    #[tokio::test]
-    async fn tool_definition() {
-        let def = ReadFileTool::new(FilePermissions::new().unwrap())
-            .definition(String::from("prompt"))
-            .await;
+    #[test]
+    fn tool_definition() {
+        let tool = ReadFileTool::new(FilePermissions::new().unwrap());
+        let def = rig::tool::tool_definition(&tool);
         assert_snapshot!(serde_json::to_string_pretty(&def).unwrap(), @r#"
         {
           "name": "read-file",
@@ -245,7 +246,7 @@ mod tests {
         let path = file_env.write_file("hello.txt", "hi".as_bytes());
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let err = tool
-            .call(ReadFileToolArgs {
+            .call(&mut ToolContext::new(), ReadFileToolArgs {
                 file_path: path.to_string_lossy().into(),
                 start_line: None,
                 end_line: None,
@@ -259,7 +260,7 @@ mod tests {
     async fn read_file_does_not_exist() {
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let err = tool
-            .call(ReadFileToolArgs {
+            .call(&mut ToolContext::new(), ReadFileToolArgs {
                 file_path: String::from("abba.txt"),
                 start_line: None,
                 end_line: None,
@@ -275,7 +276,7 @@ mod tests {
     async fn read_file_full() {
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let result = tool
-            .call(ReadFileToolArgs {
+            .call(&mut ToolContext::new(), ReadFileToolArgs {
                 file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
                 start_line: None,
                 end_line: None,
@@ -304,7 +305,7 @@ mod tests {
     async fn read_file_line_range() {
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let result = tool
-            .call(ReadFileToolArgs {
+            .call(&mut ToolContext::new(), ReadFileToolArgs {
                 file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
                 start_line: Some(2),
                 end_line: Some(4),
@@ -327,7 +328,7 @@ mod tests {
         tool.max_lines = 3;
         tool.max_bytes = 100_000;
         let result = tool
-            .call(ReadFileToolArgs {
+            .call(&mut ToolContext::new(), ReadFileToolArgs {
                 file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
                 start_line: None,
                 end_line: None,
@@ -350,7 +351,7 @@ mod tests {
         tool.max_lines = 1_000;
         tool.max_bytes = 50;
         let result = tool
-            .call(ReadFileToolArgs {
+            .call(&mut ToolContext::new(), ReadFileToolArgs {
                 file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
                 start_line: None,
                 end_line: None,
