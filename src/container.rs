@@ -90,13 +90,6 @@ impl RunSpec {
 /// environment, and never any host secret).
 pub(crate) fn run_argv(rt: &str, spec: &RunSpec) -> Vec<String> {
     let sandbox = spec.sandbox_dir.to_string_lossy().into_owned();
-    // Rootless podman maps the container uid to a subuid unless told to keep
-    // the host uid, which would make the bind mount unwritable.
-    let userns: &[String] = if rt == RuntimeKind::Podman.binary() {
-        &["--userns=keep-id".to_string()]
-    } else {
-        &[]
-    };
     let mut argv = vec![
         rt.to_string(),
         "run".to_string(),
@@ -140,9 +133,23 @@ pub(crate) fn run_argv(rt: &str, spec: &RunSpec) -> Vec<String> {
         "sleep".to_string(),
         "infinity".to_string(),
     ];
-    let user_idx = argv.iter().position(|a| a == "--user").unwrap_or(0);
-    argv.splice(user_idx..user_idx, userns.iter().cloned());
+    if needs_keep_id(rt) {
+        let user_idx = argv.iter().position(|a| a == "--user").unwrap_or(0);
+        argv.insert(user_idx, "--userns=keep-id".to_string());
+    }
     argv
+}
+
+/// Whether the runtime needs an explicit user-namespace flag to keep the host
+/// uid mapped into the container so the read-write bind mount stays writable.
+///
+/// Rootless podman on Linux maps the container uid to a subuid by default,
+/// which would leave the mount unwritable; `keep-id` fixes that. Podman machine
+/// (macOS/Windows) already maps the client uid, and `keep-id` makes concurrent
+/// container starts fail inside crun (`ping_group_range` / id-map races), so it
+/// is only requested on Linux.
+fn needs_keep_id(rt: &str) -> bool {
+    rt == RuntimeKind::Podman.binary() && cfg!(target_os = "linux")
 }
 
 pub(crate) fn exec_argv(rt: &str, name: &str, cmd: &str) -> Vec<String> {
@@ -453,9 +460,18 @@ mod tests {
         }
     }
 
+    /// Strips the platform-dependent `--userns=keep-id` entry so argv snapshots
+    /// are identical across Linux and macOS/Windows; the flag's presence and
+    /// position are asserted in `run_argv_keep_id_is_linux_only`.
+    fn without_keep_id(argv: Vec<String>) -> Vec<String> {
+        argv.into_iter()
+            .filter(|arg| arg != "--userns=keep-id")
+            .collect()
+    }
+
     #[test]
     fn run_argv_is_stable() {
-        let argv = sample_spec().argv(RuntimeKind::Podman);
+        let argv = without_keep_id(sample_spec().argv(RuntimeKind::Podman));
         assert_snapshot!(serde_json::to_string_pretty(&argv).unwrap(), @r#"
         [
           "podman",
@@ -474,7 +490,6 @@ mod tests {
           "4",
           "--security-opt",
           "no-new-privileges:true",
-          "--userns=keep-id",
           "--user",
           "1000:1000",
           "--network",
@@ -506,15 +521,33 @@ mod tests {
 
     #[test]
     fn run_argv_differs_only_by_binary() {
-        let podman = sample_spec().argv(RuntimeKind::Podman);
+        let podman = without_keep_id(sample_spec().argv(RuntimeKind::Podman));
         let docker = sample_spec().argv(RuntimeKind::Docker);
         assert_eq!(podman[0], "podman");
         assert_eq!(docker[0], "docker");
-        let podman: Vec<_> = podman[1..]
-            .iter()
-            .filter(|a| *a != "--userns=keep-id")
-            .collect();
-        assert_eq!(podman, docker[1..].iter().collect::<Vec<_>>());
+        assert_eq!(podman[1..], docker[1..]);
+    }
+
+    /// `keep-id` is required for rootless podman on Linux so the bind mount
+    /// stays writable, but must not be requested elsewhere: podman machine
+    /// (macOS/Windows) already maps the client uid, and the flag makes
+    /// concurrent container starts fail inside crun.
+    #[test]
+    fn run_argv_keep_id_is_linux_only() {
+        let podman = sample_spec().argv(RuntimeKind::Podman);
+        let docker = sample_spec().argv(RuntimeKind::Docker);
+
+        let keep_id = podman.iter().position(|arg| arg == "--userns=keep-id");
+        if cfg!(target_os = "linux") {
+            let idx = keep_id.expect("rootless podman on Linux keeps the host uid");
+            assert_eq!(podman[idx + 1], "--user");
+        } else {
+            assert_eq!(keep_id, None, "keep-id must be Linux-only");
+        }
+        assert!(
+            !docker.iter().any(|arg| arg == "--userns=keep-id"),
+            "docker does not need keep-id"
+        );
     }
 
     #[test]
