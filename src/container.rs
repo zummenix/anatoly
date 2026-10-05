@@ -326,7 +326,7 @@ impl ContainerRuntime {
         let argv = vec![
             self.kind.binary().to_string(),
             "image".to_string(),
-            "exists".to_string(),
+            "inspect".to_string(),
             image.to_string(),
         ];
         run_sync(&argv, self.kind).is_ok_and(|o| o.status.success())
