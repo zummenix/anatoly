@@ -18,10 +18,14 @@ RUN apt-get update \
         git \
         grep \
         gzip \
+        libssl-dev \
         nodejs \
         npm \
+        pkg-config \
         python3 \
         python-is-python3 \
+        python3-pip \
+        python3-venv \
         sed \
         tar \
         yarnpkg \
@@ -33,7 +37,11 @@ RUN ln -s /usr/bin/yarnpkg /usr/local/bin/yarn \
         sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.98.1 --no-modify-path \
     && rm /tmp/rustup-init.sh
 
+# The root filesystem is read-only at runtime, so per-user installs (cargo,
+# npm -g) must target the writable /tmp tmpfs; put those bin dirs on PATH too.
 ENV RUSTUP_HOME=/usr/local/rustup \
-    PATH=/usr/local/cargo/bin:$PATH
+    CARGO_HOME=/tmp/.cargo \
+    npm_config_prefix=/tmp/npm \
+    PATH=/tmp/.cargo/bin:/tmp/npm/bin:/usr/local/cargo/bin:$PATH
 
 WORKDIR /tmp

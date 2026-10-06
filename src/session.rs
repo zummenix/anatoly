@@ -607,6 +607,30 @@ mod tests {
 
         let session = Session::start(&repo).expect("start session");
 
+        // Regression guard: git must work inside the container. On podman
+        // machine the mount root can appear root-owned, which without an
+        // injected `safe.directory` fails every git command with exit 128.
+        let git = session
+            .runtime
+            .exec(
+                &session.container_name,
+                "echo x > note.txt && git add note.txt && git commit -q -m note \
+                 && git log -1 --format='%cn <%ce>'",
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .expect("exec git");
+        assert!(
+            git.success,
+            "git must work inside the sandbox: {}",
+            String::from_utf8_lossy(&git.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&git.stdout).contains("test <test@example.com>"),
+            "commit identity must come from the repo config: {}",
+            String::from_utf8_lossy(&git.stdout)
+        );
+
         let result = session
             .runtime
             .exec(

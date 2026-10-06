@@ -23,7 +23,9 @@ host                                         container (podman, "sleep infinity"
   output are propagated back to the model.
 - The container runs on the default bridge network, with `--read-only`, a `/tmp`
   tmpfs, and only explicitly listed environment variables. Its image includes
-  Rust 1.98.1 via rustup, Python, Node.js/npm, and Yarn; Anatoly can download
+  Rust 1.98.1 via rustup, Python (with `venv`/`pip`), Node.js/npm, Yarn, and the
+  system TLS development libraries `pkg-config` + `libssl-dev`; per-user installs
+  (`cargo install`, `npm -g`) land under the writable `/tmp`. Anatoly can download
   additional tools and project dependencies as needed.
 
 ## Setup

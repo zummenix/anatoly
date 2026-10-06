@@ -125,6 +125,16 @@ pub(crate) fn run_argv(rt: &str, spec: &RunSpec) -> Vec<String> {
         format!("GIT_COMMITTER_NAME={}", spec.git.name),
         "-e".to_string(),
         format!("GIT_COMMITTER_EMAIL={}", spec.git.email),
+        // The mount root can appear root-owned (e.g. virtiofs on podman
+        // machine) even though the session runs as the host uid, which makes
+        // git refuse the clone with "detected dubious ownership". Trust the
+        // one directory this container actually serves.
+        "-e".to_string(),
+        "GIT_CONFIG_COUNT=1".to_string(),
+        "-e".to_string(),
+        "GIT_CONFIG_KEY_0=safe.directory".to_string(),
+        "-e".to_string(),
+        format!("GIT_CONFIG_VALUE_0={sandbox}"),
         "-v".to_string(),
         format!("{sandbox}:{sandbox}"),
         "-w".to_string(),
@@ -508,6 +518,12 @@ mod tests {
           "GIT_COMMITTER_NAME=Code Assistant",
           "-e",
           "GIT_COMMITTER_EMAIL=agent@example.com",
+          "-e",
+          "GIT_CONFIG_COUNT=1",
+          "-e",
+          "GIT_CONFIG_KEY_0=safe.directory",
+          "-e",
+          "GIT_CONFIG_VALUE_0=/home/user/project-sandbox-1700000000",
           "-v",
           "/home/user/project-sandbox-1700000000:/home/user/project-sandbox-1700000000",
           "-w",
