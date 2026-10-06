@@ -24,7 +24,7 @@ pub(crate) enum SessionError {
 #[derive(Debug, Clone)]
 pub(crate) struct SandboxPlan {
     pub(crate) git_enabled: bool,
-    pub(crate) repo_root: PathBuf,
+    pub(crate) root_dir: PathBuf,
     pub(crate) sandbox_dir: PathBuf,
     pub(crate) branch: Option<String>,
     pub(crate) container_name: String,
@@ -38,7 +38,7 @@ impl SandboxPlan {
             return Vec::new();
         };
 
-        let root = self.repo_root.to_string_lossy().into_owned();
+        let root = self.root_dir.to_string_lossy().into_owned();
         let sandbox = self.sandbox_dir.to_string_lossy().into_owned();
         vec![
             vec![
@@ -61,7 +61,7 @@ impl SandboxPlan {
 
 pub(crate) struct Session {
     pub(crate) sandbox_dir: PathBuf,
-    pub(crate) repo_root: PathBuf,
+    pub(crate) root_dir: PathBuf,
     pub(crate) branch: Option<String>,
     pub(crate) main_branch: Option<String>,
     pub(crate) container_name: String,
@@ -80,12 +80,12 @@ impl Session {
         runtime.ensure_available()?;
 
         // Clean up strays from previous `kill -9` runs. Never removes dirs.
-        match runtime.cleanup_orphans(&plan.repo_root) {
+        match runtime.cleanup_orphans(&plan.root_dir) {
             Ok(ids) if !ids.is_empty() => {
                 println!(
                     "Removed {} stray container(s) for {}: {}",
                     ids.len(),
-                    plan.repo_root.display(),
+                    plan.root_dir.display(),
                     ids.join(", ")
                 );
             }
@@ -95,14 +95,16 @@ impl Session {
 
         let main_branch = plan
             .git_enabled
-            .then(|| git_current_branch(&plan.repo_root))
+            .then(|| git_current_branch(&plan.root_dir))
             .flatten();
 
         if plan.git_enabled {
             prepare_clone(&plan)?;
+        } else {
+            prepare_copy(&plan)?;
         }
 
-        let (uid, gid) = host_uid_gid(&plan.repo_root)?;
+        let (uid, gid) = host_uid_gid(&plan.sandbox_dir)?;
         let image = container::env_nonempty("ANATOLY_SANDBOX_IMAGE")
             .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string());
         if !runtime.image_exists(&image) {
@@ -115,7 +117,7 @@ impl Session {
 
         let spec = RunSpec {
             name: plan.container_name.clone(),
-            repo_root: plan.repo_root.clone(),
+            repo_root: plan.root_dir.clone(),
             image: image.clone(),
             sandbox_dir: plan.sandbox_dir.clone(),
             memory: container::env_nonempty("ANATOLY_SANDBOX_MEMORY")
@@ -124,13 +126,13 @@ impl Session {
                 .unwrap_or_else(|| "4".to_string()),
             uid,
             gid,
-            git: git_identity(&plan.repo_root),
+            git: git_identity(&plan.root_dir),
         };
         runtime.run_detached(&spec)?;
 
         let session = Session {
             sandbox_dir: plan.sandbox_dir,
-            repo_root: plan.repo_root,
+            root_dir: plan.root_dir,
             branch: plan.branch,
             main_branch,
             container_name: plan.container_name,
@@ -144,7 +146,7 @@ impl Session {
     fn print_start(&self, image: &str) {
         println!("\nSandbox session ready.");
         println!("  container: {} (image {image})", self.container_name);
-        println!("  repo:      {}", self.repo_root.display());
+        println!("  root:      {}", self.root_dir.display());
         println!("  sandbox:   {}", self.sandbox_dir.display());
         if self.git_enabled {
             println!(
@@ -178,7 +180,8 @@ impl Session {
         );
         if !self.git_enabled {
             println!(
-                "Fallback mode (not a git repository): working directory was {}",
+                "Fallback mode (not a git repository): a copy of {} is preserved at {}",
+                self.root_dir.display(),
                 self.sandbox_dir.display()
             );
             return;
@@ -207,7 +210,7 @@ pub(crate) fn plan(cwd: &Path, timestamp: u64) -> Result<SandboxPlan, SessionErr
             let sandbox_dir = sandbox_dir_for(&repo_root, timestamp);
             Ok(SandboxPlan {
                 git_enabled: true,
-                repo_root,
+                root_dir: repo_root,
                 sandbox_dir,
                 branch: Some(format!("anatoly/{timestamp}")),
                 container_name,
@@ -215,8 +218,8 @@ pub(crate) fn plan(cwd: &Path, timestamp: u64) -> Result<SandboxPlan, SessionErr
         }
         None => Ok(SandboxPlan {
             git_enabled: false,
-            repo_root: cwd.to_path_buf(),
-            sandbox_dir: cwd.to_path_buf(),
+            root_dir: cwd.to_path_buf(),
+            sandbox_dir: fallback_sandbox_dir(timestamp)?,
             branch: None,
             container_name,
         }),
@@ -237,13 +240,92 @@ fn prepare_clone(plan: &SandboxPlan) -> Result<(), SessionError> {
     Ok(())
 }
 
-fn sandbox_dir_for(repo_root: &Path, timestamp: u64) -> PathBuf {
+fn prepare_copy(plan: &SandboxPlan) -> Result<(), SessionError> {
+    let root_dir = plan.root_dir.canonicalize()?;
+    if plan.sandbox_dir.starts_with(&root_dir) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "temporary sandbox directory is inside the source directory",
+        )
+        .into());
+    }
+
+    std::fs::create_dir(&plan.sandbox_dir)?;
+    let result = copy_directory_contents(&plan.root_dir, &plan.sandbox_dir);
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&plan.sandbox_dir);
+    }
+    result
+}
+
+fn copy_directory_contents(source: &Path, destination: &Path) -> Result<(), SessionError> {
+    for entry in std::fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        let metadata = std::fs::symlink_metadata(&source_path)?;
+        let file_type = metadata.file_type();
+
+        if file_type.is_symlink() {
+            copy_symlink(&source_path, &destination_path)?;
+        } else if file_type.is_dir() {
+            std::fs::create_dir(&destination_path)?;
+            copy_directory_contents(&source_path, &destination_path)?;
+        } else if file_type.is_file() {
+            std::fs::copy(&source_path, &destination_path)?;
+        } else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("unsupported file type: {}", source_path.display()),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<(), SessionError> {
+    std::os::unix::fs::symlink(std::fs::read_link(source)?, destination)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<(), SessionError> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let target = std::fs::read_link(source)?;
+    if std::fs::metadata(source).is_ok_and(|metadata| metadata.is_dir()) {
+        symlink_dir(target, destination)?;
+    } else {
+        symlink_file(target, destination)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_symlink(_source: &Path, _destination: &Path) -> Result<(), SessionError> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "copying symbolic links is not supported on this platform",
+    )
+    .into())
+}
+
+fn fallback_sandbox_dir(timestamp: u64) -> Result<PathBuf, SessionError> {
+    Ok(std::env::temp_dir().canonicalize()?.join(format!(
+        "anatoly-workspace-{}-{timestamp}",
+        std::process::id()
+    )))
+}
+
+fn sandbox_dir_for(root_dir: &Path, timestamp: u64) -> PathBuf {
     if let Some(dir) = container::env_nonempty("ANATOLY_SANDBOX_DIR") {
         return PathBuf::from(dir);
     }
 
-    let parent = repo_root.parent().unwrap_or(repo_root);
-    let name = repo_root
+    let parent = root_dir.parent().unwrap_or(root_dir);
+    let name = root_dir
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "repo".to_string());
@@ -348,10 +430,55 @@ mod tests {
         let plan = plan(temp.path(), 1_700_000_000).expect("plan");
 
         assert!(!plan.git_enabled);
-        assert_eq!(plan.sandbox_dir, temp.path());
+        assert_eq!(plan.root_dir, temp.path());
+        assert_ne!(plan.sandbox_dir, temp.path());
+        assert!(plan.sandbox_dir.is_absolute());
+        assert_eq!(
+            plan.sandbox_dir.parent(),
+            Some(std::env::temp_dir().canonicalize().unwrap().as_path())
+        );
         assert_eq!(plan.branch, None);
         assert_eq!(plan.container_name, "anatoly-1700000000");
         assert!(plan.git_commands().is_empty());
+    }
+
+    #[test]
+    fn fallback_copy_is_independent_and_preserves_symlinks() {
+        let temp = temp_dir::TempDir::new().expect("temp dir");
+        let source = temp.path().join("source");
+        let destination = temp.path().join("copy");
+        std::fs::create_dir(&source).expect("mkdir source");
+        std::fs::create_dir(source.join("nested")).expect("mkdir nested");
+        std::fs::write(source.join("nested/file.txt"), "original").expect("write source");
+        let outside = temp.path().join("outside.txt");
+        std::fs::write(&outside, "outside").expect("write outside");
+
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, source.join("outside-link")).expect("create symlink");
+
+        let plan = SandboxPlan {
+            git_enabled: false,
+            root_dir: source.clone(),
+            sandbox_dir: destination.clone(),
+            branch: None,
+            container_name: "anatoly-test".to_string(),
+        };
+        prepare_copy(&plan).expect("prepare copy");
+
+        assert_eq!(
+            std::fs::read_to_string(destination.join("nested/file.txt")).unwrap(),
+            "original"
+        );
+        std::fs::write(destination.join("nested/file.txt"), "changed").expect("edit copy");
+        assert_eq!(
+            std::fs::read_to_string(source.join("nested/file.txt")).unwrap(),
+            "original"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::read_link(destination.join("outside-link")).unwrap(),
+            outside
+        );
     }
 
     #[test]

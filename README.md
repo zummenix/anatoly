@@ -78,8 +78,10 @@ that repository.
 
 ## Fallback mode
 
-Outside a git repository, anatoly skips the clone and branch: the container
-mounts the current directory instead, and no consolidation step is printed.
+Outside a git repository, anatoly skips the clone and branch and copies the
+current directory into a persistent workspace under the system temporary
+directory. The container mounts the copy, leaving the original untouched. At
+the end of the session, review the copy and manually keep or remove it.
 
 ## Development
 
