@@ -1,5 +1,5 @@
 use crate::utils::FilePermissions;
-use rig::tool::{Tool, ToolContext};
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use std::{
     fmt::Display,
     io::{BufRead, BufReader},
@@ -89,6 +89,13 @@ impl Tool for ReadFileTool {
 
     fn parameters(&self) -> serde_json::Value {
         serde_json::to_value(schemars::schema_for!(ReadFileToolArgs)).unwrap()
+    }
+
+    /// Without this override Rig redacts any error that is not already a
+    /// [`ToolExecutionError`] to the generic string "the tool failed", hiding
+    /// the path and IO reason the model needs to correct its request.
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        ToolExecutionError::other(error.to_string())
     }
 
     async fn call(
@@ -276,6 +283,31 @@ mod tests {
         let ReadFileToolError::FailedToReadFile(file_path, io_error) = err;
         assert_eq!(file_path, "abba.txt");
         assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// The failure detail must reach the model; Rig's default `map_error`
+    /// would replace it with the generic string "the tool failed".
+    #[tokio::test]
+    async fn failures_surface_detail_to_the_model() {
+        let tool = ReadFileTool::new(FilePermissions::new().unwrap());
+        let err = tool
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("abba.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
+            .await
+            .expect_err("tool failure");
+        let feedback = tool
+            .map_error(err)
+            .model_feedback()
+            .expect("text feedback")
+            .to_string();
+        assert!(feedback.contains("abba.txt"), "{feedback}");
+        assert!(feedback.contains("Failed to read file"), "{feedback}");
     }
 
     #[tokio::test]

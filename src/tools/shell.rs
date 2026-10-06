@@ -1,6 +1,6 @@
 use crate::container::{ContainerError, ContainerRuntime};
 use crate::utils::{SnipTextFmtCtx, snip_long_text};
-use rig::tool::{Tool, ToolContext};
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use std::time::Duration;
 
 /// Runs commands inside the session's long-lived sandbox container.
@@ -49,6 +49,17 @@ impl Tool for ShellTool {
 
     fn parameters(&self) -> serde_json::Value {
         serde_json::to_value(schemars::schema_for!(ShellToolArgs)).unwrap()
+    }
+
+    /// Without this override Rig redacts any error that is not already a
+    /// [`ToolExecutionError`] to the generic string "the tool failed", so the
+    /// command's stdout/stderr and exit status would never reach the model.
+    /// The transcript is exactly what the model needs, so surface it verbatim.
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        match error {
+            ShellToolError::Failure(message) => ToolExecutionError::other(message),
+            ShellToolError::Runtime(error) => ToolExecutionError::other(error.to_string()),
+        }
     }
 
     async fn call(
@@ -124,5 +135,26 @@ mod tests {
           }
         }
         "#);
+    }
+
+    /// The command transcript must reach the model; Rig's default `map_error`
+    /// would replace it with the generic string "the tool failed".
+    #[test]
+    fn failures_surface_command_output_to_the_model() {
+        let runtime = ContainerRuntime::for_kind(crate::container::RuntimeKind::Podman);
+        let tool = ShellTool::new(runtime, "anatoly-1".to_string(), Duration::from_secs(300));
+
+        let transcript = "Exit status: 128\nstdout:\n\nstderr:\nfatal: not a git repository";
+        let mapped = tool.map_error(ShellToolError::Failure(transcript.to_string()));
+        assert_eq!(mapped.model_feedback(), Some(transcript));
+
+        let mapped = tool.map_error(ShellToolError::Runtime(ContainerError::TimedOut(300)));
+        assert!(
+            mapped
+                .model_feedback()
+                .is_some_and(|feedback| feedback.contains("timed out")),
+            "runtime errors must keep their detail, got {:?}",
+            mapped.model_feedback()
+        );
     }
 }
