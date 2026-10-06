@@ -194,7 +194,7 @@ impl Session {
         println!("  sandbox: {sandbox}");
         println!("  branch:  {branch}");
         println!("\nTo review and consolidate on the host:");
-        println!("  git fetch {sandbox} 'refs/heads/*:refs/remotes/anatoly/*'");
+        println!("  git fetch {sandbox} 'refs/heads/anatoly/*:refs/remotes/anatoly/*'");
         println!("  git log {base}..{branch}      # review; `git diff {base}..{branch}` likewise");
         println!("  git merge --no-ff {branch}    # or rebase / cherry-pick");
         println!("  rm -rf {sandbox}              # when done");

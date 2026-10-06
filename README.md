@@ -62,14 +62,7 @@ cargo run
 
 The sandbox clone, its branch, and its commit history are **never deleted
 automatically**. On Ctrl-C (or Ctrl-D) only the container is removed and
-anatoly prints the commands to review and merge, e.g.:
-
-```sh
-git fetch /Users/…/anatoly-sandbox-<ts> 'refs/heads/*:refs/remotes/anatoly/*'
-git log   <main-branch>..anatoly/<ts>   # review; `git diff` likewise
-git merge --no-ff anatoly/<ts>          # or rebase / cherry-pick
-rm -rf /Users/…/anatoly-sandbox-<ts>    # when done
-```
+anatoly prints the commands to review and merge the session branch.
 
 If the process is `kill -9`'d the container may be left behind; the next start
 removes stray containers labelled with the repository path. Run **one session
