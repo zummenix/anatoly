@@ -21,8 +21,10 @@ host                                         container (podman, "sleep infinity"
 - `read-file` is a host-side tool, re-rooted at the sandbox directory.
 - `shell` = `podman exec` into the container (`bash -c <cmd>`); exit codes and
   output are propagated back to the model.
-- The container runs with `--network none`, `--read-only`, a `/tmp` tmpfs, and
-  only explicitly listed environment variables.
+- The container runs on the default bridge network, with `--read-only`, a `/tmp`
+  tmpfs, and only explicitly listed environment variables. Its image includes
+  Rust 1.98.1 via rustup, Python, Node.js/npm, and Yarn; Anatoly can download
+  additional tools and project dependencies as needed.
 
 ## Setup
 

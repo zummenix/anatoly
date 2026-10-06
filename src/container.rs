@@ -85,9 +85,9 @@ impl RunSpec {
 }
 
 /// Builds the `run` argv. This is the security-critical vector: exactly one
-/// read-write bind mount (the sandbox at its own path), no network, and only
-/// explicit `-e KEY=VALUE` entries (never a bare `-e` that would forward host
-/// environment, and never any host secret).
+/// read-write bind mount (the sandbox at its own path), network access, and
+/// only explicit `-e KEY=VALUE` entries (never a bare `-e` that would forward
+/// host environment, and never any host secret).
 pub(crate) fn run_argv(rt: &str, spec: &RunSpec) -> Vec<String> {
     let sandbox = spec.sandbox_dir.to_string_lossy().into_owned();
     let mut argv = vec![
@@ -100,7 +100,7 @@ pub(crate) fn run_argv(rt: &str, spec: &RunSpec) -> Vec<String> {
         format!("{REPO_LABEL}={}", spec.repo_root.display()),
         "--read-only".to_string(),
         "--tmpfs".to_string(),
-        "/tmp:size=4g".to_string(),
+        "/tmp:size=4g,exec".to_string(),
         "--memory".to_string(),
         spec.memory.clone(),
         "--cpus".to_string(),
@@ -110,7 +110,7 @@ pub(crate) fn run_argv(rt: &str, spec: &RunSpec) -> Vec<String> {
         "--user".to_string(),
         format!("{}:{}", spec.uid, spec.gid),
         "--network".to_string(),
-        "none".to_string(),
+        "bridge".to_string(),
         "-e".to_string(),
         "HOME=/tmp".to_string(),
         "-e".to_string(),
@@ -483,7 +483,7 @@ mod tests {
           "anatoly.repo=/home/user/project",
           "--read-only",
           "--tmpfs",
-          "/tmp:size=4g",
+          "/tmp:size=4g,exec",
           "--memory",
           "4g",
           "--cpus",
@@ -493,7 +493,7 @@ mod tests {
           "--user",
           "1000:1000",
           "--network",
-          "none",
+          "bridge",
           "-e",
           "HOME=/tmp",
           "-e",
@@ -613,7 +613,7 @@ mod tests {
 
     /// Exactly one read-write bind mount: the sandbox, at its own absolute path.
     #[test]
-    fn run_argv_has_single_rw_mount_and_no_network() {
+    fn run_argv_has_single_rw_mount_and_network_access() {
         let argv = sample_spec().argv(RuntimeKind::Podman);
 
         let mounts: Vec<&String> = argv
@@ -632,7 +632,7 @@ mod tests {
             .iter()
             .position(|arg| arg == "--network")
             .expect("--network present");
-        assert_eq!(argv[network_idx + 1], "none");
+        assert_eq!(argv[network_idx + 1], "bridge");
     }
 
     /// Gated integration test: exec round-trip, exit-code propagation, and files
