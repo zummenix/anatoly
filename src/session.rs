@@ -1,5 +1,7 @@
+use std::hash::{BuildHasher, Hash, Hasher, RandomState};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::container::{
@@ -10,8 +12,8 @@ use crate::container::{
 pub(crate) enum SessionError {
     #[error("git command failed: {0}")]
     GitFailed(String),
-    #[error("Sandbox directory '{0}' already exists and is not empty")]
-    SandboxDirNotEmpty(PathBuf),
+    #[error("Session {0} '{1}' already exists")]
+    NameCollision(&'static str, String),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -73,11 +75,12 @@ impl Session {
     /// Boots a session rooted at `cwd`: plans the sandbox, clones the repo (if
     /// any), starts the long-lived container, and returns a handle.
     pub(crate) fn start(cwd: &Path) -> Result<Self, SessionError> {
-        let timestamp = unix_timestamp();
-        let plan = plan(cwd, timestamp)?;
+        let suffix = random_suffix();
+        let plan = plan(cwd, &suffix)?;
 
         let runtime = ContainerRuntime::from_env()?;
         runtime.ensure_available()?;
+        check_name_collisions(&plan, &runtime)?;
 
         // Clean up strays from previous `kill -9` runs. Never removes dirs.
         match runtime.cleanup_orphans(&plan.root_dir) {
@@ -104,42 +107,54 @@ impl Session {
             prepare_copy(&plan)?;
         }
 
-        let (uid, gid) = host_uid_gid(&plan.sandbox_dir)?;
-        let image = container::env_nonempty("ANATOLY_SANDBOX_IMAGE")
-            .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string());
-        if !runtime.image_exists(&image) {
-            eprintln!(
-                "Warning: sandbox image '{image}' not found locally. \
-                 Build it with `make sandbox-image RUNTIME={}`.",
-                runtime.binary()
-            );
-        }
+        let session = (|| {
+            let (uid, gid) = host_uid_gid(&plan.sandbox_dir)?;
+            let image = container::env_nonempty("ANATOLY_SANDBOX_IMAGE")
+                .unwrap_or_else(|| DEFAULT_SANDBOX_IMAGE.to_string());
+            if !runtime.image_exists(&image) {
+                eprintln!(
+                    "Warning: sandbox image '{image}' not found locally. \
+                     Build it with `make sandbox-image RUNTIME={}`.",
+                    runtime.binary()
+                );
+            }
 
-        let spec = RunSpec {
-            name: plan.container_name.clone(),
-            repo_root: plan.root_dir.clone(),
-            image: image.clone(),
-            sandbox_dir: plan.sandbox_dir.clone(),
-            memory: container::env_nonempty("ANATOLY_SANDBOX_MEMORY")
-                .unwrap_or_else(|| "4g".to_string()),
-            cpus: container::env_nonempty("ANATOLY_SANDBOX_CPUS")
-                .unwrap_or_else(|| "4".to_string()),
-            uid,
-            gid,
-            git: git_identity(&plan.root_dir),
-        };
-        runtime.run_detached(&spec)?;
+            let spec = RunSpec {
+                name: plan.container_name.clone(),
+                repo_root: plan.root_dir.clone(),
+                image: image.clone(),
+                sandbox_dir: plan.sandbox_dir.clone(),
+                memory: container::env_nonempty("ANATOLY_SANDBOX_MEMORY")
+                    .unwrap_or_else(|| "4g".to_string()),
+                cpus: container::env_nonempty("ANATOLY_SANDBOX_CPUS")
+                    .unwrap_or_else(|| "4".to_string()),
+                uid,
+                gid,
+                git: git_identity(&plan.root_dir),
+            };
+            runtime.run_detached(&spec)?;
 
-        let session = Session {
-            sandbox_dir: plan.sandbox_dir,
-            root_dir: plan.root_dir,
-            branch: plan.branch,
-            main_branch,
-            container_name: plan.container_name,
-            runtime,
-            git_enabled: plan.git_enabled,
+            Ok::<_, SessionError>((
+                Session {
+                    sandbox_dir: plan.sandbox_dir.clone(),
+                    root_dir: plan.root_dir.clone(),
+                    branch: plan.branch.clone(),
+                    main_branch,
+                    container_name: plan.container_name.clone(),
+                    runtime,
+                    git_enabled: plan.git_enabled,
+                },
+                image,
+            ))
+        })();
+        let (session, image) = match session {
+            Ok(session) => session,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&plan.sandbox_dir);
+                return Err(err);
+            }
         };
-        session.print_start(&spec.image);
+        session.print_start(&image);
         Ok(session)
     }
 
@@ -188,56 +203,85 @@ impl Session {
         }
 
         let sandbox = self.sandbox_dir.display();
-        let branch = self.branch.as_deref().unwrap_or("anatoly/<session>");
+        let branch = self.branch.as_deref().unwrap_or("<session>");
+        let remote_branch = format!("refs/remotes/{branch}");
         let base = self.main_branch.as_deref().unwrap_or("main");
         println!("The sandbox clone and branch were preserved:");
         println!("  sandbox: {sandbox}");
         println!("  branch:  {branch}");
         println!("\nTo review and consolidate on the host:");
-        println!("  git fetch {sandbox} 'refs/heads/anatoly/*:refs/remotes/anatoly/*'");
-        println!("  git log {base}..{branch}      # review; `git diff {base}..{branch}` likewise");
-        println!("  git merge --no-ff {branch}    # or rebase / cherry-pick");
+        println!("  git fetch {sandbox} '{branch}:{remote_branch}'");
+        println!(
+            "  git log {base}..{remote_branch}      # review; `git diff {base}..{remote_branch}` likewise"
+        );
+        println!("  git merge --no-ff {remote_branch}    # or rebase / cherry-pick");
         println!("  rm -rf {sandbox}              # when done");
     }
 }
 
-/// Computes the session plan for `cwd` at a given unix timestamp.
-pub(crate) fn plan(cwd: &Path, timestamp: u64) -> Result<SandboxPlan, SessionError> {
-    let container_name = format!("anatoly-{timestamp}");
-
+/// Computes the session plan for `cwd` using the provided unique suffix.
+pub(crate) fn plan(cwd: &Path, suffix: &str) -> Result<SandboxPlan, SessionError> {
     match git_toplevel(cwd) {
         Some(repo_root) => {
-            let sandbox_dir = sandbox_dir_for(&repo_root, timestamp);
+            let name = session_name(&repo_root, suffix);
+            let sandbox_dir = sandbox_dir_for(&repo_root, &name);
             Ok(SandboxPlan {
                 git_enabled: true,
                 root_dir: repo_root,
                 sandbox_dir,
-                branch: Some(format!("anatoly/{timestamp}")),
-                container_name,
+                branch: Some(name.clone()),
+                container_name: name,
             })
         }
-        None => Ok(SandboxPlan {
-            git_enabled: false,
-            root_dir: cwd.to_path_buf(),
-            sandbox_dir: fallback_sandbox_dir(timestamp)?,
-            branch: None,
-            container_name,
-        }),
+        None => {
+            let name = session_name(cwd, suffix);
+            Ok(SandboxPlan {
+                git_enabled: false,
+                root_dir: cwd.to_path_buf(),
+                sandbox_dir: std::env::temp_dir().canonicalize()?.join(&name),
+                branch: None,
+                container_name: name,
+            })
+        }
     }
 }
 
-fn prepare_clone(plan: &SandboxPlan) -> Result<(), SessionError> {
-    if plan.sandbox_dir.exists() {
-        let mut entries = plan.sandbox_dir.read_dir()?;
-        if entries.next().is_some() {
-            return Err(SessionError::SandboxDirNotEmpty(plan.sandbox_dir.clone()));
-        }
+fn check_name_collisions(
+    plan: &SandboxPlan,
+    runtime: &ContainerRuntime,
+) -> Result<(), SessionError> {
+    if plan.sandbox_dir.try_exists()? {
+        return Err(SessionError::NameCollision(
+            "sandbox directory",
+            plan.sandbox_dir.display().to_string(),
+        ));
     }
-
-    for argv in plan.git_commands() {
-        run_git(&argv)?;
+    if let Some(branch) = &plan.branch
+        && branch_exists(&plan.root_dir, branch)?
+    {
+        return Err(SessionError::NameCollision("branch", branch.clone()));
+    }
+    if runtime.container_exists(&plan.container_name)? {
+        return Err(SessionError::NameCollision(
+            "container",
+            plan.container_name.clone(),
+        ));
     }
     Ok(())
+}
+
+fn prepare_clone(plan: &SandboxPlan) -> Result<(), SessionError> {
+    std::fs::create_dir(&plan.sandbox_dir)?;
+    let result = (|| {
+        for argv in plan.git_commands() {
+            run_git(&argv)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_dir_all(&plan.sandbox_dir);
+    }
+    result
 }
 
 fn prepare_copy(plan: &SandboxPlan) -> Result<(), SessionError> {
@@ -312,24 +356,44 @@ fn copy_symlink(_source: &Path, _destination: &Path) -> Result<(), SessionError>
     .into())
 }
 
-fn fallback_sandbox_dir(timestamp: u64) -> Result<PathBuf, SessionError> {
-    Ok(std::env::temp_dir().canonicalize()?.join(format!(
-        "anatoly-workspace-{}-{timestamp}",
-        std::process::id()
-    )))
+fn session_name(root_dir: &Path, suffix: &str) -> String {
+    let project = root_dir
+        .file_name()
+        .map(|name| name.to_string_lossy())
+        .map(|name| project_slug(&name))
+        .unwrap_or_else(|| "project".to_string());
+    format!("anatoly-{project}-{suffix}")
 }
 
-fn sandbox_dir_for(root_dir: &Path, timestamp: u64) -> PathBuf {
+fn project_slug(name: &str) -> String {
+    let mut slug = String::new();
+    for character in name.chars() {
+        if character.is_ascii_alphanumeric() {
+            slug.push(character.to_ascii_lowercase());
+        } else if !slug.is_empty() && !slug.ends_with('-') {
+            slug.push('-');
+        }
+        if slug.len() == 48 {
+            break;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug
+    }
+}
+
+fn sandbox_dir_for(root_dir: &Path, name: &str) -> PathBuf {
     if let Some(dir) = container::env_nonempty("ANATOLY_SANDBOX_DIR") {
         return PathBuf::from(dir);
     }
 
     let parent = root_dir.parent().unwrap_or(root_dir);
-    let name = root_dir
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "repo".to_string());
-    parent.join(format!("{name}-sandbox-{timestamp}"))
+    parent.join(name)
 }
 
 fn git_toplevel(cwd: &Path) -> Option<PathBuf> {
@@ -358,6 +422,23 @@ fn git_current_branch(repo_root: &Path) -> Option<String> {
     }
     let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!branch.is_empty()).then_some(branch)
+}
+
+fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool, SessionError> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["show-ref", "--quiet", "--verify"])
+        .arg(format!("refs/heads/{branch}"))
+        .output()?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(SessionError::GitFailed(format!(
+            "git show-ref failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ))),
+    }
 }
 
 fn git_config(repo_root: &Path, key: &str) -> Option<String> {
@@ -412,11 +493,24 @@ fn host_uid_gid(_path: &Path) -> Result<(u32, u32), SessionError> {
     Ok((1000, 1000))
 }
 
-fn unix_timestamp() -> u64 {
+fn random_suffix() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let mut hasher = RandomState::new().build_hasher();
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+        .unwrap_or_default()
+        .as_nanos()
+        .hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    COUNTER.fetch_add(1, Ordering::Relaxed).hash(&mut hasher);
+
+    let mut value = hasher.finish();
+    let mut suffix = String::with_capacity(8);
+    for _ in 0..8 {
+        suffix.push(char::from(b'a' + (value % 26) as u8));
+        value /= 26;
+    }
+    suffix
 }
 
 #[cfg(test)]
@@ -427,7 +521,7 @@ mod tests {
     #[test]
     fn plan_falls_back_outside_a_git_repo() {
         let temp = temp_dir::TempDir::new().expect("temp dir");
-        let plan = plan(temp.path(), 1_700_000_000).expect("plan");
+        let plan = plan(temp.path(), "abcdefgh").expect("plan");
 
         assert!(!plan.git_enabled);
         assert_eq!(plan.root_dir, temp.path());
@@ -438,8 +532,24 @@ mod tests {
             Some(std::env::temp_dir().canonicalize().unwrap().as_path())
         );
         assert_eq!(plan.branch, None);
-        assert_eq!(plan.container_name, "anatoly-1700000000");
+        assert!(plan.container_name.starts_with("anatoly-"));
+        assert!(plan.container_name.ends_with("-abcdefgh"));
+        assert_eq!(
+            plan.sandbox_dir.file_name().unwrap().to_string_lossy(),
+            plan.container_name
+        );
         assert!(plan.git_commands().is_empty());
+    }
+
+    #[test]
+    fn session_name_uses_a_normalized_project_and_lowercase_suffix() {
+        let root = Path::new("/tmp/My Wallet");
+        let name = session_name(root, "abcdefgh");
+        let suffix = random_suffix();
+
+        assert_eq!(name, "anatoly-my-wallet-abcdefgh");
+        assert_eq!(suffix.len(), 8);
+        assert!(suffix.bytes().all(|byte| byte.is_ascii_lowercase()));
     }
 
     #[test]
@@ -500,13 +610,13 @@ mod tests {
         );
         let _guard = settings.bind_to_scope();
 
-        let plan = plan(&repo, 1_700_000_000).expect("plan");
+        let plan = plan(&repo, "abcdefgh").expect("plan");
         assert!(plan.git_enabled);
-        assert_eq!(plan.branch.as_deref(), Some("anatoly/1700000000"));
-        assert_eq!(plan.container_name, "anatoly-1700000000");
+        assert_eq!(plan.branch.as_deref(), Some("anatoly-repo-abcdefgh"));
+        assert_eq!(plan.container_name, "anatoly-repo-abcdefgh");
         assert_eq!(
             plan.sandbox_dir.file_name().unwrap().to_string_lossy(),
-            "repo-sandbox-1700000000"
+            "anatoly-repo-abcdefgh"
         );
         assert_eq!(
             plan.sandbox_dir.parent(),
@@ -518,15 +628,15 @@ mod tests {
             "git",
             "clone",
             "[TMP]/repo",
-            "[TMP]/repo-sandbox-1700000000"
+            "[TMP]/anatoly-repo-abcdefgh"
           ],
           [
             "git",
             "-C",
-            "[TMP]/repo-sandbox-1700000000",
+            "[TMP]/anatoly-repo-abcdefgh",
             "checkout",
             "-b",
-            "anatoly/1700000000"
+            "anatoly-repo-abcdefgh"
           ]
         ]
         "#);

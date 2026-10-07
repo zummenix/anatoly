@@ -55,7 +55,7 @@ cargo run
 |---|---|---|
 | `ANATOLY_RUNTIME` | `auto` (podman → docker) | container CLI to use |
 | `ANATOLY_SANDBOX_IMAGE` | `anatoly-sandbox:0.1` | image to run |
-| `ANATOLY_SANDBOX_DIR` | sibling `<root>-sandbox-<ts>` | clone location |
+| `ANATOLY_SANDBOX_DIR` | sibling `anatoly-<project>-<random>` | clone location |
 | `ANATOLY_SANDBOX_MEMORY` | `4g` | container memory cap |
 | `ANATOLY_SANDBOX_CPUS` | `4` | container CPU cap |
 | `ANATOLY_SHELL_TIMEOUT` | `300` | per-exec wall-clock seconds |

@@ -364,6 +364,17 @@ impl ContainerRuntime {
         ];
         run_sync(&argv, self.kind).is_ok_and(|o| o.status.success())
     }
+
+    /// Whether a container with `name` already exists in this runtime.
+    pub(crate) fn container_exists(&self, name: &str) -> Result<bool, ContainerError> {
+        let argv = vec![
+            self.kind.binary().to_string(),
+            "container".to_string(),
+            "inspect".to_string(),
+            name.to_string(),
+        ];
+        Ok(run_sync(&argv, self.kind)?.status.success())
+    }
 }
 
 async fn read_capped<R: AsyncRead + Unpin>(
