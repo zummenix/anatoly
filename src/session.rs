@@ -179,18 +179,24 @@ impl Session {
     /// directory and branch are intentionally preserved.
     pub(crate) fn shutdown(&self) {
         println!("\n\nRemoving container...");
-        if let Err(err) = self.runtime.remove_force(&self.container_name) {
+        let removal_result = self.runtime.remove_force(&self.container_name);
+        if let Err(err) = &removal_result {
             eprintln!(
                 "Warning: failed to remove container '{}': {err}",
                 self.container_name
             );
         }
-        self.print_consolidation();
+        self.print_consolidation(removal_result.is_ok());
     }
 
-    fn print_consolidation(&self) {
+    fn print_consolidation(&self, container_removed: bool) {
+        let removal_status = if container_removed {
+            "removed"
+        } else {
+            "may still be running"
+        };
         println!(
-            "\nSession ended. Container '{}' removed.",
+            "\nSession ended. Container '{}' {removal_status}.",
             self.container_name
         );
         if !self.git_enabled {
@@ -209,6 +215,12 @@ impl Session {
         println!("The sandbox clone and branch were preserved:");
         println!("  sandbox: {sandbox}");
         println!("  branch:  {branch}");
+        if let Some(commits) = git_log_oneline(&self.sandbox_dir, base, branch) {
+            println!("\nNew commits in {branch}:");
+            for commit in commits {
+                println!("  {commit}");
+            }
+        }
         println!("\nTo review and consolidate on the host:");
         println!("  git fetch {sandbox} '{branch}:{remote_branch}'");
         println!(
@@ -422,6 +434,25 @@ fn git_current_branch(repo_root: &Path) -> Option<String> {
     }
     let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
     (!branch.is_empty()).then_some(branch)
+}
+
+fn git_log_oneline(repo_root: &Path, base: &str, branch: &str) -> Option<Vec<String>> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["log", "--oneline", "--no-color"])
+        .arg(format!("{base}..{branch}"))
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let commits: Vec<_> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect();
+    (!commits.is_empty()).then_some(commits)
 }
 
 fn branch_exists(repo_root: &Path, branch: &str) -> Result<bool, SessionError> {
@@ -640,6 +671,39 @@ mod tests {
           ]
         ]
         "#);
+    }
+
+    #[test]
+    fn git_log_oneline_lists_commits_since_base() {
+        let temp = temp_dir::TempDir::new().expect("temp dir");
+        let repo = temp.path();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(repo)
+                .args(args)
+                .output()
+                .expect("run git");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init"]);
+        git(&["config", "user.name", "test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["checkout", "-b", "base"]);
+        std::fs::write(repo.join("file"), "base").expect("write base file");
+        git(&["add", "file"]);
+        git(&["commit", "-m", "base commit"]);
+        git(&["checkout", "-b", "session"]);
+        std::fs::write(repo.join("file"), "session").expect("write session file");
+        git(&["commit", "-am", "session commit"]);
+
+        let commits = git_log_oneline(repo, "base", "session").expect("read commit log");
+        assert_eq!(commits.len(), 1);
+        assert!(commits[0].ends_with("session commit"));
     }
 
     /// Returns the runtime + image when both are usable, otherwise `None` so
