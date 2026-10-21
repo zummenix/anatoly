@@ -1,7 +1,7 @@
 # anatoly
 
-A Rust CLI code assistant (rig-core + OpenRouter) with three tools: `think`,
-`read-file`, and `shell`.
+A Rust CLI code assistant (rig-core + OpenRouter) with two tools: `read-file`
+and `shell`.
 
 Commands run inside an isolated, long-lived container instead of on the host.
 At session start anatoly makes a **disposable `git clone`** of the repository
@@ -20,13 +20,12 @@ host                                         container (podman, "sleep infinity"
 - The LLM calls and `OPENROUTER_API_KEY` never leave the host.
 - `read-file` is a host-side tool, re-rooted at the sandbox directory.
 - `shell` = `podman exec` into the container (`bash -c <cmd>`); exit codes and
-  output are propagated back to the model.
-- The container runs on the default bridge network, with `--read-only`, a `/tmp`
-  tmpfs, and only explicitly listed environment variables. Its image includes
-  Rust 1.98.1 via rustup, Python (with `venv`/`pip`), Node.js/npm, Yarn, and the
-  system TLS development libraries `pkg-config` + `libssl-dev`; per-user installs
-  (`cargo install`, `npm -g`) land under the writable `/tmp`. Anatoly can download
-  additional tools and project dependencies as needed.
+- The container can be run with `--read-only`, a `/tmp` tmpfs, and only
+  explicitly listed environment variables. Rust 1.98.1 via rustup, Python (with
+  `venv`/`pip`), Node.js/npm, Yarn, and the system TLS development libraries
+  `pkg-config` + `libssl-dev`; per-user installs (`cargo install`, `npm -g`)
+  land under the writable `/tmp`. Anatoly can download additional tools and
+  project dependencies as needed.
 
 ## Setup
 
