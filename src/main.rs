@@ -6,6 +6,7 @@ use rig::{
     completion::{Message, PromptError, Usage},
     core::{DynModel, operation::Completion},
     effect::EffectKind,
+    message::UserContent,
     providers::openrouter,
     tool::{Tool, builtin::ThinkTool},
 };
@@ -111,6 +112,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await;
         history = new_history;
 
+        let response = match response {
+            Ok(response) => response,
+            Err(err) => {
+                eprintln!("\nRequest failed: {err}\n");
+                continue;
+            }
+        };
+
         let output = response.output;
         println!("\n\n---\n{output}\n\n---\n\n");
 
@@ -172,8 +181,62 @@ fn agent_builder(
         })
 }
 
+/// Maximum number of attempts before a recoverable failure is surfaced.
+const MAX_ATTEMPTS: usize = 5;
+
+/// Whether retrying the whole run could plausibly succeed.
+///
+/// Provider and bus failures carry their own retryability classification:
+/// transport resets, timeouts, 408/425/429 and 5xx are recoverable; rejected
+/// credentials and malformed replies are not. The remaining variants are
+/// deterministic for the same input and history — memory failures, an
+/// exhausted turn budget, cancellation, and a tool call the model is not
+/// allowed to make — so retrying them only repeats the same failure.
+fn is_recoverable(error: &PromptError) -> bool {
+    match error {
+        PromptError::CompletionError(error) => error.is_retryable(),
+        PromptError::Report(report) => report.is_retryable(),
+        PromptError::MemoryError(_)
+        | PromptError::MaxTurnsError { .. }
+        | PromptError::PromptCancelled { .. }
+        | PromptError::UnknownToolCall { .. } => false,
+    }
+}
+
+fn contains_tool_result(message: &Message) -> bool {
+    matches!(
+        message,
+        Message::User { content }
+            if content
+                .iter()
+                .any(|item| matches!(item, UserContent::ToolResult(_)))
+    )
+}
+
+/// Builds the result after giving up on a recoverable error or surfacing an
+/// unrecoverable one.
+///
+/// A pending tool result is committed: the tool already ran, and returning a
+/// prefix that ended on its assistant tool call would leave a dangling call the
+/// next request cannot answer. A plain user prompt is not committed because the
+/// request never succeeded.
+fn give_up(
+    mut history: Vec<Message>,
+    pending_prompt: Message,
+    error: PromptError,
+) -> (Vec<Message>, Result<PromptResponse, PromptError>) {
+    if contains_tool_result(&pending_prompt) {
+        history.push(pending_prompt);
+    }
+    (history, Err(error))
+}
+
 /// Runs `attempt` until it succeeds, resuming from the furthest progress the
-/// agent reached after each failure.
+/// agent reached after each recoverable failure.
+///
+/// Gives up after [`MAX_ATTEMPTS`] attempts or on a failure that is not
+/// recoverable, returning the error alongside a coherent history so the caller
+/// can report it and continue with whatever progress was committed.
 ///
 /// `attempt` is called with the pending message and the committed history.
 /// `snapshot` returns the hook's record of the last request's full history
@@ -184,29 +247,43 @@ async fn run_with_retries<A, AF, S>(
     mut pending_prompt: Message,
     mut attempt: A,
     snapshot: S,
-) -> (Vec<Message>, PromptResponse)
+) -> (Vec<Message>, Result<PromptResponse, PromptError>)
 where
     A: FnMut(Message, Vec<Message>) -> AF,
     AF: Future<Output = Result<PromptResponse, PromptError>>,
     S: Fn() -> Vec<Message>,
 {
+    let mut attempts = 0;
     let mut retrying_interval = 1;
     loop {
+        attempts += 1;
         match attempt(pending_prompt.clone(), history.clone()).await {
             Ok(response) => {
                 if let Some(messages) = &response.messages {
                     history.extend_from_slice(messages);
                 }
-                return (history, response);
+                return (history, Ok(response));
             }
             Err(err) => {
-                eprintln!("{err}\n\nRetrying after: {retrying_interval}s");
+                // Salvage progress even when giving up, so a deterministic
+                // failure does not discard the tool turns that completed.
                 if resume_from_snapshot(&mut history, &mut pending_prompt, &snapshot()) {
                     eprintln!(
                         "Resuming from saved progress ({} messages in history).",
                         history.len()
                     );
                 }
+
+                if !is_recoverable(&err) {
+                    eprintln!("{err}\n\nNot retrying: this failure is not recoverable.");
+                    return give_up(history, pending_prompt, err);
+                }
+                if attempts >= MAX_ATTEMPTS {
+                    eprintln!("{err}\n\nGiving up after {attempts} attempts.");
+                    return give_up(history, pending_prompt, err);
+                }
+
+                eprintln!("{err}\n\nRetrying after: {retrying_interval}s");
                 tokio::time::sleep(Duration::from_secs(retrying_interval)).await;
                 retrying_interval += 1;
             }
@@ -355,8 +432,18 @@ mod tests {
         )
     }
 
+    /// A provider failure rig classifies as retryable: a reply cut short.
     fn provider_error() -> PromptError {
-        PromptError::CompletionError(ProviderError::Response("provider exploded".into()))
+        PromptError::CompletionError(ProviderError::Truncated)
+    }
+
+    fn unknown_tool_error() -> PromptError {
+        PromptError::UnknownToolCall {
+            tool_name: "missing".into(),
+            available_tools: vec!["shell".into()],
+            allowed_tools: vec!["shell".into()],
+            chat_history: vec![],
+        }
     }
 
     /// The assistant turn the rig `add` mock tool call deserializes to.
@@ -479,6 +566,7 @@ mod tests {
             run_with_retries(vec![], user("task"), attempt, snapshot_reader).await;
 
         assert_eq!(*calls.lock().unwrap(), 2);
+        let response = response.expect("the retry succeeds");
         assert_eq!(response.output, "done");
         assert_eq!(
             history,
@@ -523,9 +611,10 @@ mod tests {
             move || snapshot.lock().unwrap().clone()
         };
 
-        let (history, _response) =
+        let (history, response) =
             run_with_retries(vec![], user("task"), attempt, snapshot_reader).await;
 
+        response.expect("the retry succeeds");
         assert_eq!(
             history,
             vec![user("task"), assistant("done")],
@@ -543,10 +632,132 @@ mod tests {
         };
         let no_snapshot = || Vec::<Message>::new();
 
-        let (history, _response) =
+        let (history, response) =
             run_with_retries(vec![], user("task"), attempt, no_snapshot).await;
 
+        response.expect("the attempt succeeds on the first try");
         assert_eq!(history, vec![user("task"), assistant("done")]);
+    }
+
+    #[test]
+    fn recoverability_follows_the_error_classification() {
+        // Transport failures and truncated replies may end on the next attempt.
+        assert!(is_recoverable(&provider_error()));
+        assert!(is_recoverable(&PromptError::Report(
+            ProviderError::Truncated.report()
+        )));
+
+        // A provider failure without a preserved reply, malformed responses,
+        // and wrong credentials are deterministic.
+        assert!(!is_recoverable(&PromptError::Report(
+            ProviderError::Provider("boom".into()).report()
+        )));
+        assert!(!is_recoverable(&PromptError::Report(
+            ProviderError::Response("malformed".into()).report()
+        )));
+
+        // These repeat identically for the same input and history.
+        assert!(!is_recoverable(&unknown_tool_error()));
+        assert!(!is_recoverable(&PromptError::MaxTurnsError {
+            max_turns: 1,
+            chat_history: vec![],
+            prompt: user("task"),
+        }));
+        assert!(!is_recoverable(&PromptError::PromptCancelled {
+            chat_history: vec![],
+            reason: "cancelled".into(),
+        }));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gives_up_after_max_attempts_of_a_recoverable_error() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let attempt_calls = Arc::clone(&calls);
+        let attempt = move |_pending: Message, _history: Vec<Message>| {
+            let attempt_calls = Arc::clone(&attempt_calls);
+            async move {
+                *attempt_calls.lock().unwrap() += 1;
+                Err(provider_error())
+            }
+        };
+        let no_snapshot = || Vec::<Message>::new();
+
+        let (history, result) = run_with_retries(vec![], user("task"), attempt, no_snapshot).await;
+
+        assert_eq!(*calls.lock().unwrap(), MAX_ATTEMPTS);
+        assert!(matches!(
+            result,
+            Err(PromptError::CompletionError(ProviderError::Truncated))
+        ));
+        assert_eq!(history, vec![]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn non_recoverable_failure_is_not_retried_but_keeps_salvaged_progress() {
+        let snapshot = Arc::new(Mutex::new(Vec::<Message>::new()));
+        let calls = Arc::new(Mutex::new(0usize));
+
+        let attempt_snapshot = Arc::clone(&snapshot);
+        let attempt_calls = Arc::clone(&calls);
+        let attempt = move |_pending: Message, _history: Vec<Message>| {
+            let attempt_snapshot = Arc::clone(&attempt_snapshot);
+            let attempt_calls = Arc::clone(&attempt_calls);
+            async move {
+                *attempt_calls.lock().unwrap() += 1;
+                *attempt_snapshot.lock().unwrap() = vec![
+                    user("task"),
+                    assistant("calling missing tool"),
+                    tool_result("call-1", "42"),
+                ];
+                Err(unknown_tool_error())
+            }
+        };
+        let snapshot_reader = {
+            let snapshot = Arc::clone(&snapshot);
+            move || snapshot.lock().unwrap().clone()
+        };
+
+        let (history, result) =
+            run_with_retries(vec![], user("task"), attempt, snapshot_reader).await;
+
+        assert_eq!(*calls.lock().unwrap(), 1, "must not retry");
+        assert!(matches!(result, Err(PromptError::UnknownToolCall { .. })));
+        assert_eq!(
+            history,
+            vec![
+                user("task"),
+                assistant("calling missing tool"),
+                tool_result("call-1", "42"),
+            ],
+            "the completed tool turn must survive as a coherent history"
+        );
+    }
+
+    #[test]
+    fn give_up_drops_a_failed_prompt_but_commits_a_pending_tool_result() {
+        let (history, result) = give_up(vec![user("a")], user("b"), unknown_tool_error());
+        assert!(result.is_err());
+        assert_eq!(
+            history,
+            vec![user("a")],
+            "an unsuccessful prompt is not part of history"
+        );
+
+        let (history, result) = give_up(
+            vec![user("a"), assistant("calling shell")],
+            tool_result("call-1", "42"),
+            unknown_tool_error(),
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            history,
+            vec![
+                user("a"),
+                assistant("calling shell"),
+                tool_result("call-1", "42"),
+            ],
+            "the pending tool result closes the assistant tool call"
+        );
     }
 
     // -- End-to-end tests over rig's real agent loop -------------------------
@@ -580,6 +791,7 @@ mod tests {
             || progress.lock().unwrap().clone(),
         )
         .await;
+        let response = response.expect("the run succeeds");
 
         let transcript = vec![
             user("add 20 and 22"),
@@ -639,7 +851,11 @@ mod tests {
         // replay it exactly once.
         let model = MockCompletionModel::from_turns([
             MockTurn::tool_call("call_1", "add", json!({ "x": 20, "y": 22 })),
-            MockTurn::error("provider exploded"),
+            MockTurn::provider_response_error(
+                rig::http_client::StatusCode::INTERNAL_SERVER_ERROR,
+                "provider exploded",
+                "req_1",
+            ),
             MockTurn::text("42"),
         ]);
         let inspector = model.clone();
@@ -671,6 +887,7 @@ mod tests {
             2,
             "the provider failure must be retried once"
         );
+        let response = response.expect("the resumed run succeeds");
         assert_eq!(response.output, "42");
 
         let transcript = [
