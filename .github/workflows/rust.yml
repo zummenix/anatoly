@@ -13,6 +13,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v7
+      - name: Build sandbox image
+        run: podman build -f sandbox/Dockerfile -t anatoly-sandbox:0.1 .
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Clippy checks

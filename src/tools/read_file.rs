@@ -1,5 +1,5 @@
 use crate::utils::FilePermissions;
-use rig::{completion::ToolDefinition, tool::Tool};
+use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use std::{
     fmt::Display,
     io::{BufRead, BufReader},
@@ -83,17 +83,26 @@ impl Tool for ReadFileTool {
 
     type Output = ReadFileToolOutput;
 
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        let parameters = schemars::schema_for!(ReadFileToolArgs);
-        ToolDefinition {
-            name: Self::NAME.to_string(),
-            description: "Reads a file and returns its content with optional line range selection"
-                .to_string(),
-            parameters: serde_json::to_value(parameters).unwrap(),
-        }
+    fn description(&self) -> String {
+        "Reads a file and returns its content with optional line range selection".to_string()
     }
 
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::to_value(schemars::schema_for!(ReadFileToolArgs)).unwrap()
+    }
+
+    /// Without this override Rig redacts any error that is not already a
+    /// [`ToolExecutionError`] to the generic string "the tool failed", hiding
+    /// the path and IO reason the model needs to correct its request.
+    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
+        ToolExecutionError::other(error.to_string())
+    }
+
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         run_read_file(
             &args.file_path,
             args.start_line,
@@ -193,11 +202,10 @@ mod tests {
     use crate::test_utils::FileEnv;
     use insta::assert_snapshot;
 
-    #[tokio::test]
-    async fn tool_definition() {
-        let def = ReadFileTool::new(FilePermissions::new().unwrap())
-            .definition(String::from("prompt"))
-            .await;
+    #[test]
+    fn tool_definition() {
+        let tool = ReadFileTool::new(FilePermissions::new().unwrap());
+        let def = rig::tool::tool_definition(&tool);
         assert_snapshot!(serde_json::to_string_pretty(&def).unwrap(), @r#"
         {
           "name": "read-file",
@@ -245,11 +253,14 @@ mod tests {
         let path = file_env.write_file("hello.txt", "hi".as_bytes());
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let err = tool
-            .call(ReadFileToolArgs {
-                file_path: path.to_string_lossy().into(),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: path.to_string_lossy().into(),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect_err("tool failure");
         assert_snapshot!(err, @"Failed to read file '[TEMP_DIR]/hello.txt', IO Error: 'Access to paths outside the workspace is not allowed'");
@@ -259,11 +270,14 @@ mod tests {
     async fn read_file_does_not_exist() {
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let err = tool
-            .call(ReadFileToolArgs {
-                file_path: String::from("abba.txt"),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("abba.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect_err("tool failure");
         let ReadFileToolError::FailedToReadFile(file_path, io_error) = err;
@@ -271,15 +285,43 @@ mod tests {
         assert_eq!(io_error.kind(), std::io::ErrorKind::NotFound);
     }
 
+    /// The failure detail must reach the model; Rig's default `map_error`
+    /// would replace it with the generic string "the tool failed".
+    #[tokio::test]
+    async fn failures_surface_detail_to_the_model() {
+        let tool = ReadFileTool::new(FilePermissions::new().unwrap());
+        let err = tool
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("abba.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
+            .await
+            .expect_err("tool failure");
+        let feedback = tool
+            .map_error(err)
+            .model_feedback()
+            .expect("text feedback")
+            .to_string();
+        assert!(feedback.contains("abba.txt"), "{feedback}");
+        assert!(feedback.contains("Failed to read file"), "{feedback}");
+    }
+
     #[tokio::test]
     async fn read_file_full() {
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let result = tool
-            .call(ReadFileToolArgs {
-                file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect("tool success");
         assert_eq!(result.truncated, None);
@@ -304,11 +346,14 @@ mod tests {
     async fn read_file_line_range() {
         let tool = ReadFileTool::new(FilePermissions::new().unwrap());
         let result = tool
-            .call(ReadFileToolArgs {
-                file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
-                start_line: Some(2),
-                end_line: Some(4),
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
+                    start_line: Some(2),
+                    end_line: Some(4),
+                },
+            )
             .await
             .expect("tool success");
         assert_eq!(result.truncated, None);
@@ -327,11 +372,14 @@ mod tests {
         tool.max_lines = 3;
         tool.max_bytes = 100_000;
         let result = tool
-            .call(ReadFileToolArgs {
-                file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect("tool success");
         assert_eq!(result.truncated, Some(true));
@@ -350,11 +398,14 @@ mod tests {
         tool.max_lines = 1_000;
         tool.max_bytes = 50;
         let result = tool
-            .call(ReadFileToolArgs {
-                file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
-                start_line: None,
-                end_line: None,
-            })
+            .call(
+                &mut ToolContext::new(),
+                ReadFileToolArgs {
+                    file_path: String::from("tests/fixtures/lorem_ipsum.txt"),
+                    start_line: None,
+                    end_line: None,
+                },
+            )
             .await
             .expect("tool success");
         assert_eq!(result.truncated, Some(true));
