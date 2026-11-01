@@ -197,6 +197,17 @@ fn is_recoverable(error: &PromptError) -> bool {
     match error {
         PromptError::Provider(error) => error.is_retryable(),
         PromptError::Report(report) => report.is_retryable(),
+
+        // `PromptError` is `#[non_exhaustive]`. Every variant rig 0.46 defines
+        // is listed explicitly so a future variant cannot be mistaken for an
+        // intentional classification; the wildcard below catches variants
+        // added by a later rig release. When upgrading rig, audit this list:
+        // a new retryable variant belongs in an arm above, not in the
+        // wildcard.
+        PromptError::Memory { .. }
+        | PromptError::MaxTurns { .. }
+        | PromptError::Cancelled { .. }
+        | PromptError::UnknownToolCall { .. } => false,
         _ => false,
     }
 }
@@ -405,10 +416,12 @@ mod tests {
         completion::Usage,
         error::{ErrorKind, ProviderError},
         message::{
-            AssistantContent, AssistantMessage, CallId, ToolCall, ToolFunction, ToolName,
-            ToolResultContent, UserContent,
+            AssistantContent, AssistantMessage, CallId, Origin, StopReason, ToolCall, ToolFunction,
+            ToolName, ToolResultContent, UserContent,
         },
-        test_utils::{MockAddTool, MockCompletionModel, MockTurn},
+        test_utils::{
+            MOCK_API, MOCK_MODEL, MOCK_PROVIDER, MockAddTool, MockCompletionModel, MockTurn,
+        },
     };
     use serde_json::json;
 
@@ -442,14 +455,31 @@ mod tests {
         }
     }
 
+    /// The `origin` rig 0.46 stamps on a turn produced by the scripted mock.
+    fn mock_origin() -> Origin {
+        Origin::new(MOCK_API, MOCK_PROVIDER, MOCK_MODEL)
+    }
+
+    /// A hand-built assistant text turn carrying the provenance rig would
+    /// attach to it, so transcript assertions can compare whole messages.
+    fn assistant_with_metadata(text: &str, stop: StopReason) -> Message {
+        Message::Assistant(
+            AssistantMessage::new(vec![AssistantContent::text(text.to_owned())])
+                .with_origin(mock_origin())
+                .with_stop(stop),
+        )
+    }
+
     /// The assistant turn the rig `add` mock tool call deserializes to.
     fn assistant_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> Message {
-        Message::Assistant(AssistantMessage::new(vec![AssistantContent::ToolCall(
-            ToolCall::from_wire(
+        Message::Assistant(
+            AssistantMessage::new(vec![AssistantContent::ToolCall(ToolCall::from_wire(
                 id,
                 ToolFunction::new(ToolName::new(name).expect("non-empty tool name"), arguments),
-            ),
-        )]))
+            ))])
+            .with_origin(mock_origin())
+            .with_stop(StopReason::ToolUse),
+        )
     }
 
     /// The tool result the rig `add` mock tool commits. Its `i32` output is a
@@ -472,28 +502,15 @@ mod tests {
             .collect()
     }
 
-    /// Drops the provider metadata rig 0.46 attaches to assistant turns
-    /// (`origin` and `stop`). The retry invariants are about canonical message
-    /// content, not about which wire produced a scripted mock reply.
-    fn without_assistant_metadata(messages: impl IntoIterator<Item = Message>) -> Vec<Message> {
-        messages
-            .into_iter()
-            .map(|message| match message {
-                Message::Assistant(assistant) => {
-                    Message::Assistant(AssistantMessage::new(assistant.content))
-                }
-                message => message,
-            })
-            .collect()
-    }
-
+    /// The history a request actually sent, verbatim. Assistant turns keep the
+    /// `origin` and `stop` metadata rig attaches, so a regression that drops
+    /// provenance from a replayed request fails the comparison.
     fn request_messages(request: &rig::completion::CompletionRequest) -> Vec<Message> {
-        without_assistant_metadata(
-            request
-                .chat_history
-                .iter()
-                .map(|message| (**message).clone()),
-        )
+        request
+            .chat_history
+            .iter()
+            .map(|message| (**message).clone())
+            .collect()
     }
 
     #[test]
@@ -816,19 +833,16 @@ mod tests {
             user("add 20 and 22"),
             assistant_tool_call("call_1", "add", json!({ "x": 20, "y": 22 })),
             add_tool_result("call_1", 42),
-            assistant("done"),
+            assistant_with_metadata("done", StopReason::Stop),
         ];
 
         // Invariant #2: `response.messages` is the run transcript — the prompt,
         // accepted assistant turns, and committed tool results — excluding the
         // input history. Source: rig-agent/src/run/response.rs,
         // `PromptResponse::messages`.
+        assert_eq!(response.messages.clone(), transcript);
         assert_eq!(
-            without_assistant_metadata(response.messages.clone()),
-            transcript,
-        );
-        assert_eq!(
-            without_assistant_metadata(history),
+            history,
             input
                 .iter()
                 .cloned()
@@ -865,10 +879,7 @@ mod tests {
         );
 
         // The hook's `progress` holds the last request snapshot it took.
-        assert_eq!(
-            without_assistant_metadata(progress.lock().unwrap().clone()),
-            after_tool
-        );
+        assert_eq!(progress.lock().unwrap().clone(), after_tool);
     }
 
     #[tokio::test(start_paused = true)]
@@ -922,12 +933,12 @@ mod tests {
             user("add 20 and 22"),
             assistant_tool_call("call_1", "add", json!({ "x": 20, "y": 22 })),
             add_tool_result("call_1", 42),
-            assistant("42"),
+            assistant_with_metadata("42", StopReason::Stop),
         ];
         // Invariant #4: the completed tool turn survives the failure exactly
         // once — no duplication, no loss.
         assert_eq!(
-            without_assistant_metadata(history),
+            history,
             input
                 .iter()
                 .cloned()
@@ -1005,7 +1016,7 @@ mod tests {
         // The hook still recorded the completed tool turn: the only salvage
         // source available after the failure.
         assert_eq!(
-            without_assistant_metadata(progress.lock().unwrap().clone()),
+            progress.lock().unwrap().clone(),
             vec![
                 user("add 1 and 2"),
                 assistant_tool_call("call_1", "add", json!({ "x": 1, "y": 2 })),
@@ -1043,7 +1054,7 @@ mod tests {
             } => {
                 assert_eq!(max_turns, 1);
                 assert_eq!(
-                    without_assistant_metadata(chat_history),
+                    chat_history,
                     vec![
                         user("add 1 and 2"),
                         assistant_tool_call("call_1", "add", json!({ "x": 1, "y": 2 })),
