@@ -1,12 +1,13 @@
 use rig::{
+    DynModel,
     agent::{
         AgentBuilder, AgentHook, CompletionCallAction, CompletionCallEvent, DispatchAction,
         DispatchEvent, HookContext, OutcomeAction, OutcomeEvent, PromptResponse,
     },
     completion::{Message, PromptError, Usage},
-    core::{DynModel, operation::Completion},
     effect::EffectKind,
     message::UserContent,
+    operation::Completion,
     providers::openrouter,
     tool::{Tool, builtin::ThinkTool},
 };
@@ -120,7 +121,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         };
 
-        let output = response.output;
+        let output = response.output();
         println!("\n\n---\n{output}\n\n---\n\n");
 
         if let Some(usage) = format_usage(response.usage) {
@@ -194,12 +195,20 @@ const MAX_ATTEMPTS: usize = 5;
 /// allowed to make — so retrying them only repeats the same failure.
 fn is_recoverable(error: &PromptError) -> bool {
     match error {
-        PromptError::CompletionError(error) => error.is_retryable(),
+        PromptError::Provider(error) => error.is_retryable(),
         PromptError::Report(report) => report.is_retryable(),
-        PromptError::MemoryError(_)
-        | PromptError::MaxTurnsError { .. }
-        | PromptError::PromptCancelled { .. }
+
+        // `PromptError` is `#[non_exhaustive]`. Every variant rig 0.46 defines
+        // is listed explicitly so a future variant cannot be mistaken for an
+        // intentional classification; the wildcard below catches variants
+        // added by a later rig release. When upgrading rig, audit this list:
+        // a new retryable variant belongs in an arm above, not in the
+        // wildcard.
+        PromptError::Memory { .. }
+        | PromptError::MaxTurns { .. }
+        | PromptError::Cancelled { .. }
         | PromptError::UnknownToolCall { .. } => false,
+        _ => false,
     }
 }
 
@@ -259,9 +268,7 @@ where
         attempts += 1;
         match attempt(pending_prompt.clone(), history.clone()).await {
             Ok(response) => {
-                if let Some(messages) = &response.messages {
-                    history.extend_from_slice(messages);
-                }
+                history.extend_from_slice(&response.messages);
                 return (history, Ok(response));
             }
             Err(err) => {
@@ -395,7 +402,7 @@ impl AgentHook for ToolHook {
         {
             let mut progress = self.progress.lock().unwrap();
             progress.clear();
-            progress.extend_from_slice(event.history);
+            progress.extend(event.history.iter().map(|message| (**message).clone()));
             progress.push(event.prompt.clone());
         }
         CompletionCallAction::Continue
@@ -409,10 +416,12 @@ mod tests {
         completion::Usage,
         error::{ErrorKind, ProviderError},
         message::{
-            AssistantContent, CallId, ToolCall, ToolFunction, ToolName, ToolResultContent,
-            UserContent,
+            AssistantContent, AssistantMessage, CallId, Origin, StopReason, ToolCall, ToolFunction,
+            ToolName, ToolResultContent, UserContent,
         },
-        test_utils::{MockAddTool, MockCompletionModel, MockTurn},
+        test_utils::{
+            MOCK_API, MOCK_MODEL, MOCK_PROVIDER, MockAddTool, MockCompletionModel, MockTurn,
+        },
     };
     use serde_json::json;
 
@@ -434,7 +443,7 @@ mod tests {
 
     /// A provider failure rig classifies as retryable: a reply cut short.
     fn provider_error() -> PromptError {
-        PromptError::CompletionError(ProviderError::Truncated)
+        PromptError::Provider(ProviderError::Truncated)
     }
 
     fn unknown_tool_error() -> PromptError {
@@ -446,15 +455,31 @@ mod tests {
         }
     }
 
+    /// The `origin` rig 0.46 stamps on a turn produced by the scripted mock.
+    fn mock_origin() -> Origin {
+        Origin::new(MOCK_API, MOCK_PROVIDER, MOCK_MODEL)
+    }
+
+    /// A hand-built assistant text turn carrying the provenance rig would
+    /// attach to it, so transcript assertions can compare whole messages.
+    fn assistant_with_metadata(text: &str, stop: StopReason) -> Message {
+        Message::Assistant(
+            AssistantMessage::new(vec![AssistantContent::text(text.to_owned())])
+                .with_origin(mock_origin())
+                .with_stop(stop),
+        )
+    }
+
     /// The assistant turn the rig `add` mock tool call deserializes to.
     fn assistant_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> Message {
-        Message::Assistant {
-            id: None,
-            content: vec![AssistantContent::ToolCall(ToolCall::from_wire(
+        Message::Assistant(
+            AssistantMessage::new(vec![AssistantContent::ToolCall(ToolCall::from_wire(
                 id,
                 ToolFunction::new(ToolName::new(name).expect("non-empty tool name"), arguments),
-            ))],
-        }
+            ))])
+            .with_origin(mock_origin())
+            .with_stop(StopReason::ToolUse),
+        )
     }
 
     /// The tool result the rig `add` mock tool commits. Its `i32` output is a
@@ -474,6 +499,17 @@ mod tests {
     fn with_preamble(messages: impl IntoIterator<Item = Message>) -> Vec<Message> {
         std::iter::once(Message::system(CODE_ASSISTANT_PREAMBLE))
             .chain(messages)
+            .collect()
+    }
+
+    /// The history a request actually sent, verbatim. Assistant turns keep the
+    /// `origin` and `stop` metadata rig attaches, so a regression that drops
+    /// provenance from a replayed request fails the comparison.
+    fn request_messages(request: &rig::completion::CompletionRequest) -> Vec<Message> {
+        request
+            .chat_history
+            .iter()
+            .map(|message| (**message).clone())
             .collect()
     }
 
@@ -567,7 +603,7 @@ mod tests {
 
         assert_eq!(*calls.lock().unwrap(), 2);
         let response = response.expect("the retry succeeds");
-        assert_eq!(response.output, "done");
+        assert_eq!(response.output(), "done");
         assert_eq!(
             history,
             vec![
@@ -658,12 +694,12 @@ mod tests {
 
         // These repeat identically for the same input and history.
         assert!(!is_recoverable(&unknown_tool_error()));
-        assert!(!is_recoverable(&PromptError::MaxTurnsError {
+        assert!(!is_recoverable(&PromptError::MaxTurns {
             max_turns: 1,
             chat_history: vec![],
             prompt: user("task"),
         }));
-        assert!(!is_recoverable(&PromptError::PromptCancelled {
+        assert!(!is_recoverable(&PromptError::Cancelled {
             chat_history: vec![],
             reason: "cancelled".into(),
         }));
@@ -687,7 +723,7 @@ mod tests {
         assert_eq!(*calls.lock().unwrap(), MAX_ATTEMPTS);
         assert!(matches!(
             result,
-            Err(PromptError::CompletionError(ProviderError::Truncated))
+            Err(PromptError::Provider(ProviderError::Truncated))
         ));
         assert_eq!(history, vec![]);
     }
@@ -797,14 +833,14 @@ mod tests {
             user("add 20 and 22"),
             assistant_tool_call("call_1", "add", json!({ "x": 20, "y": 22 })),
             add_tool_result("call_1", 42),
-            assistant("done"),
+            assistant_with_metadata("done", StopReason::Stop),
         ];
 
         // Invariant #2: `response.messages` is the run transcript — the prompt,
         // accepted assistant turns, and committed tool results — excluding the
         // input history. Source: rig-agent/src/run/response.rs,
         // `PromptResponse::messages`.
-        assert_eq!(response.messages.as_deref(), Some(transcript.as_slice()));
+        assert_eq!(response.messages.clone(), transcript);
         assert_eq!(
             history,
             input
@@ -836,8 +872,11 @@ mod tests {
         // `split_last` + `build_history_for_request`) and
         // rig-agent/src/run/prepare.rs (the preamble becomes the leading
         // `Message::system`).
-        assert_eq!(with_preamble(after_prompt), requests[0].chat_history);
-        assert_eq!(with_preamble(after_tool.clone()), requests[1].chat_history);
+        assert_eq!(with_preamble(after_prompt), request_messages(&requests[0]));
+        assert_eq!(
+            with_preamble(after_tool.clone()),
+            request_messages(&requests[1])
+        );
 
         // The hook's `progress` holds the last request snapshot it took.
         assert_eq!(progress.lock().unwrap().clone(), after_tool);
@@ -888,13 +927,13 @@ mod tests {
             "the provider failure must be retried once"
         );
         let response = response.expect("the resumed run succeeds");
-        assert_eq!(response.output, "42");
+        assert_eq!(response.output(), "42");
 
         let transcript = [
             user("add 20 and 22"),
             assistant_tool_call("call_1", "add", json!({ "x": 20, "y": 22 })),
             add_tool_result("call_1", 42),
-            assistant("42"),
+            assistant_with_metadata("42", StopReason::Stop),
         ];
         // Invariant #4: the completed tool turn survives the failure exactly
         // once — no duplication, no loss.
@@ -923,10 +962,13 @@ mod tests {
         ));
         salvaged.push(add_tool_result("call_1", 42));
 
-        assert_eq!(with_preamble(salvaged.clone()), requests[1].chat_history);
+        assert_eq!(
+            with_preamble(salvaged.clone()),
+            request_messages(&requests[1])
+        );
         assert_eq!(
             with_preamble(salvaged),
-            requests[2].chat_history,
+            request_messages(&requests[2]),
             "resume must replay the salvaged prefix (tool result included), not restart"
         );
     }
@@ -953,7 +995,7 @@ mod tests {
         // Under the runtime's effect bus the failure surfaces as
         // `PromptError::Report` with `ErrorKind::Provider` (the `ProviderError`
         // wrapped in an `ErrorReport`), rather than the bare
-        // `PromptError::CompletionError` the enum alone suggests. Sources:
+        // `PromptError::Provider` the enum alone suggests. Sources:
         // rig-agent/src/agent/engine.rs (`streaming_error_into_prompt` and the
         // unary `run_model_turn`'s `CompletionDispatchError::Failed`) and
         // rig-agent/src/run/response.rs (`enum PromptError`).
@@ -964,8 +1006,8 @@ mod tests {
         assert!(
             !matches!(
                 err,
-                PromptError::MaxTurnsError { .. }
-                    | PromptError::PromptCancelled { .. }
+                PromptError::MaxTurns { .. }
+                    | PromptError::Cancelled { .. }
                     | PromptError::UnknownToolCall { .. }
             ),
             "the failure must be one of the variants that carries no history"
@@ -1001,11 +1043,11 @@ mod tests {
             .await
             .expect_err("the run exceeds its single-turn budget");
 
-        // Invariant #5: unlike a provider failure, `MaxTurnsError` carries
+        // Invariant #5: unlike a provider failure, `MaxTurns` carries
         // `chat_history`, a secondary salvage source. Source:
         // rig-agent/src/run/response.rs, `enum PromptError`.
         match err {
-            PromptError::MaxTurnsError {
+            PromptError::MaxTurns {
                 max_turns,
                 chat_history,
                 prompt,
@@ -1021,7 +1063,7 @@ mod tests {
                 );
                 assert_eq!(prompt, add_tool_result("call_1", 3));
             }
-            other => panic!("expected MaxTurnsError, got {other:?}"),
+            other => panic!("expected MaxTurns, got {other:?}"),
         }
     }
 }
